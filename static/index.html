@@ -213,28 +213,28 @@
     <div class="modal-card">
       <h2>♠️ Stratos Poker Arena</h2>
       <div class="auth-tabs" role="tablist">
-        <button type="button" id="tabLogin" class="on" onclick="showAuthPane('login')">Sign in</button>
-        <button type="button" id="tabRegister" onclick="showAuthPane('register')">Register</button>
+        <button type="button" id="tabRegister" class="on" onclick="showAuthPane('register')">Email + phone</button>
+        <button type="button" id="tabLogin" onclick="showAuthPane('login')">PIN sign-in</button>
         <button type="button" id="tabReset" onclick="showAuthPane('reset')">Forgot PIN</button>
       </div>
 
-      <form class="auth-pane on" id="paneLogin" onsubmit="submitLogin(event)">
-        <p class="auth-help">Sign in with your email id or phone number and your PIN.</p>
+      <form class="auth-pane" id="paneLogin" onsubmit="submitLogin(event)">
+        <p class="auth-help">Quick sign-in if you added a PIN: your email id or phone number and your PIN.</p>
         <input type="text" id="loginIdInput" placeholder="Email id or phone number" maxlength="120" autocomplete="username" required />
         <input type="password" id="loginPinInput" placeholder="PIN (4 to 6 digits)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="current-password" required />
         <div class="form-error" id="loginError"></div>
         <button type="submit" class="btn-action" id="loginBtn" style="width:100%;">Enter Arena Lobby</button>
       </form>
 
-      <form class="auth-pane" id="paneRegister" onsubmit="submitRegistration(event)">
-        <p class="auth-help">New player: register once to keep your bankroll, stats and daily bonus. Registered before PINs existed? Enter your same email id and phone number here once and choose a PIN.</p>
+      <form class="auth-pane on" id="paneRegister" onsubmit="submitRegistration(event)">
+        <p class="auth-help">Register once to keep your bankroll, stats and daily bonus. Already registered? Enter the same email id and phone number. A PIN is optional: add one for quick sign-in later.</p>
         <input type="text" id="playerNameInput" placeholder="Your name" maxlength="15" autocomplete="nickname" required />
         <input type="email" id="playerEmailInput" placeholder="Email id" maxlength="120" autocomplete="email" required />
         <input type="tel" id="playerPhoneInput" placeholder="Phone number (with country code)" maxlength="20" autocomplete="tel" required />
-        <input type="password" id="playerPinInput" placeholder="Choose a PIN (4 to 6 digits)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" required />
-        <input type="password" id="playerPin2Input" placeholder="Type the PIN again" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" required />
+        <input type="password" id="playerPinInput" placeholder="PIN, optional (4 to 6 digits)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" />
+        <input type="password" id="playerPin2Input" placeholder="Type the PIN again (only if you added one)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" />
         <div class="form-error" id="registerError"></div>
-        <button type="submit" class="btn-action" id="registerBtn" style="width:100%;">Register &amp; Enter</button>
+        <button type="submit" class="btn-action" id="registerBtn" style="width:100%;">Enter Arena Lobby</button>
       </form>
 
       <form class="auth-pane" id="paneReset" onsubmit="submitReset(event)">
@@ -508,7 +508,7 @@
     function signOut() {
       authToken = localPlayerId = localPlayerName = null;
       store("poker_token", null); store("poker_pid", null); store("poker_name", null);
-      showAuthPane("login");
+      showAuthPane("register");
       document.getElementById("registerOverlay").style.display = "flex";
     }
 
@@ -614,7 +614,7 @@
       if (name.length < 2) { errBox.innerText = "Enter a name (2 to 15 letters)."; return; }
       if (!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(email)) { errBox.innerText = "Enter a valid email id."; return; }
       if (phone.replace(/\D/g, "").length < 8) { errBox.innerText = "Enter a valid phone number."; return; }
-      if (!pinOk(pin, document.getElementById("playerPin2Input").value.trim(), errBox)) return;
+      if (pin && !pinOk(pin, document.getElementById("playerPin2Input").value.trim(), errBox)) return;
       await authRequest("/api/register", { name, email, phone, pin }, errBox, btn);
     }
 

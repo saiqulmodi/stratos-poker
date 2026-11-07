@@ -1096,8 +1096,8 @@ def signed_in(player_id: str, token: str, recovery_key: Optional[str] = None) ->
 
 @app.post("/api/register")
 async def register(request: Request):
-    """Sign up with name + email + phone + PIN. Players registered before PINs existed
-    use this once (same email + phone) to set their PIN."""
+    """Sign up (name + email + phone) or sign back in (same email + phone), as before.
+    The PIN is optional: if one is given it is saved (or replaced) for quick sign-in later."""
     data = await read_json(request)
     if data is None:
         return bad("Bad request.")
@@ -1111,29 +1111,28 @@ async def register(request: Request):
         return bad("Enter a valid email id.")
     if not phone:
         return bad("Enter a valid phone number (8 to 15 digits).")
-    if not PIN_RE.match(pin):
-        return bad("Choose a PIN of 4 to 6 digits.")
+    if pin and not PIN_RE.match(pin):
+        return bad("The PIN must be 4 to 6 digits (or leave it empty).")
 
-    recovery = new_recovery_key()
+    recovery = new_recovery_key() if pin else None
     conn = db()
     try:
-        row = conn.execute("SELECT player_id, phone, token, pin_hash FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute("SELECT player_id, phone, token FROM users WHERE email = ?", (email,)).fetchone()
         if row:
-            if row[3]:
-                return bad("This email id is already registered. Use Sign in with your PIN, or Forgot PIN.", 409)
             if not same_phone(row[1], phone):
                 return bad("This email id is already registered with a different phone number.", 409)
             player_id, token = row[0], row[2] or secrets.token_urlsafe(24)
-            conn.execute("""UPDATE users SET player_name = ?, token = ?, pin_hash = ?, recovery_hash = ?,
-                                             pin_fails = 0, pin_locked_until = NULL WHERE player_id = ?""",
-                         (name, token, hash_secret(pin), hash_secret(clean_recovery_key(recovery)), player_id))
+            conn.execute("UPDATE users SET player_name = ?, token = ? WHERE player_id = ?", (name, token, player_id))
         else:
             player_id, token = "u_" + secrets.token_hex(6), secrets.token_urlsafe(24)
             conn.execute("""INSERT INTO users (player_id, player_name, chips, hands_played, hands_won, total_winnings,
-                                               email, phone, token, created_at, streak, pin_hash, recovery_hash)
-                            VALUES (?, ?, ?, 0, 0, 0, ?, ?, ?, ?, 0, ?, ?)""",
-                         (player_id, name, START_CHIPS, email, phone, token, int(time.time()),
-                          hash_secret(pin), hash_secret(clean_recovery_key(recovery))))
+                                               email, phone, token, created_at, streak)
+                            VALUES (?, ?, ?, 0, 0, 0, ?, ?, ?, ?, 0)""",
+                         (player_id, name, START_CHIPS, email, phone, token, int(time.time())))
+        if pin:
+            conn.execute("""UPDATE users SET pin_hash = ?, recovery_hash = ?, pin_fails = 0, pin_locked_until = NULL
+                            WHERE player_id = ?""",
+                         (hash_secret(pin), hash_secret(clean_recovery_key(recovery)), player_id))
         conn.commit()
     finally:
         conn.close()
@@ -1160,8 +1159,8 @@ async def login(request: Request):
         if not row:
             return bad(err, 404)
         if not row[3]:
-            return bad("This account has no PIN yet. Use Register once with the same email id and phone number "
-                       "to choose your PIN.", 409)
+            return bad("This account has no PIN. Sign in with your email id and phone number "
+                       "(you can add a PIN there).", 409)
         locked = locked_message(row)
         if locked:
             return bad(locked, 429)
