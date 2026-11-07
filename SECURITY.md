@@ -8,7 +8,7 @@ Only the latest code on the `main` branch (the live server) receives security fi
 
 Please do **not** open a public issue for security problems.
 
-Report them privately through GitHub: **Security and quality -> Advisories -> Report a vulnerability** on this repository, or by email to the maintainer at saiqulmodi@gmail.com.
+Report them privately through GitHub's private vulnerability reporting: open the **Security and quality** tab of this repository, choose **Report a vulnerability**, and fill in the form. Only the maintainer can see the report.
 
 Please include:
 

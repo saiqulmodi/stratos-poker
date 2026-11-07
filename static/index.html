@@ -146,6 +146,30 @@
       width: 100%; padding: 12px; border-radius: 6px; border: 1px solid #4b5563; background: #030712; color: #ffffff; font-size: 15px; margin-bottom: 12px;
     }
     #registerOverlay input { margin-bottom: 12px; }
+    #registerOverlay input[type="password"], #registerOverlay input[type="text"] {
+      width: 100%; padding: 12px; border-radius: 6px; border: 1px solid #4b5563; background: #030712; color: #ffffff; font-size: 15px;
+    }
+    .auth-tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+    .auth-tabs button { flex: 1; padding: 9px 6px; border-radius: 6px; border: 1px solid #374151; background: #0f172a; color: #94a3b8; font-weight: 700; cursor: pointer; }
+    .auth-tabs button.on { background: #0284c7; color: #fff; border-color: #38bdf8; }
+    .auth-pane { display: none; }
+    .auth-pane.on { display: block; }
+    .auth-help { color: #94a3b8; font-size: 13px; margin: 0 0 14px; text-align: left; }
+    .recovery-key { font: bold 22px monospace; letter-spacing: 2px; color: #facc15; background: #030712; border: 1px dashed #facc15; border-radius: 8px; padding: 12px; margin: 12px 0; user-select: all; }
+
+    /* After-hand review: every player's cards with a right/wrong verdict */
+    #reviewPanel { display: none; width: min(860px, calc(100% - 16px)); margin: 8px auto 0; background: #111827; border: 1px solid #374151; border-radius: 10px; padding: 10px 12px; }
+    #reviewPanel h3 { margin: 0 0 6px; font-size: 15px; color: #c084fc; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .review-board { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; font-size: 12px; color: #94a3b8; margin-bottom: 8px; }
+    .review-row { display: grid; grid-template-columns: minmax(90px, 140px) auto 1fr; gap: 8px; align-items: center; padding: 6px 0; border-top: 1px solid #1f2937; font-size: 13px; }
+    .review-row.me { background: #0b1220; }
+    .review-cards { display: flex; gap: 3px; }
+    .mini-card { background: #fff; color: #000; border-radius: 4px; padding: 2px 5px; font-weight: 700; font-size: 13px; min-width: 30px; text-align: center; }
+    .mini-card.red { color: #dc2626; }
+    .mini-card.unplayed { opacity: 0.55; border: 1px dashed #64748b; }
+    .verdict-right { color: #4ade80; }
+    .verdict-wrong { color: #f87171; }
+    @media (max-width: 560px) { .review-row { grid-template-columns: 1fr auto; } .review-row .verdict { grid-column: 1 / -1; } }
     .form-error { color: #f87171; font-size: 13px; min-height: 18px; margin: 4px 0 10px; }
     .form-note { color: #64748b; font-size: 12px; margin-top: 12px; }
     #toast {
@@ -183,13 +207,40 @@
   <div id="registerOverlay">
     <div class="modal-card">
       <h2>♠️ Stratos Poker Arena</h2>
-      <p style="color: #94a3b8; font-size: 14px; margin-bottom: 20px;">Register once to keep your bankroll, stats and daily bonus. Already registered? Enter the same email id and phone number.</p>
-      <form onsubmit="submitRegistration(event)">
+      <div class="auth-tabs" role="tablist">
+        <button type="button" id="tabLogin" class="on" onclick="showAuthPane('login')">Sign in</button>
+        <button type="button" id="tabRegister" onclick="showAuthPane('register')">Register</button>
+        <button type="button" id="tabReset" onclick="showAuthPane('reset')">Forgot PIN</button>
+      </div>
+
+      <form class="auth-pane on" id="paneLogin" onsubmit="submitLogin(event)">
+        <p class="auth-help">Sign in with your email id or phone number and your PIN.</p>
+        <input type="text" id="loginIdInput" placeholder="Email id or phone number" maxlength="120" autocomplete="username" required />
+        <input type="password" id="loginPinInput" placeholder="PIN (4 to 6 digits)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="current-password" required />
+        <div class="form-error" id="loginError"></div>
+        <button type="submit" class="btn-action" id="loginBtn" style="width:100%;">Enter Arena Lobby</button>
+      </form>
+
+      <form class="auth-pane" id="paneRegister" onsubmit="submitRegistration(event)">
+        <p class="auth-help">New player: register once to keep your bankroll, stats and daily bonus. Registered before PINs existed? Enter your same email id and phone number here once and choose a PIN.</p>
         <input type="text" id="playerNameInput" placeholder="Your name" maxlength="15" autocomplete="nickname" required />
         <input type="email" id="playerEmailInput" placeholder="Email id" maxlength="120" autocomplete="email" required />
         <input type="tel" id="playerPhoneInput" placeholder="Phone number (with country code)" maxlength="20" autocomplete="tel" required />
+        <input type="password" id="playerPinInput" placeholder="Choose a PIN (4 to 6 digits)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" required />
+        <input type="password" id="playerPin2Input" placeholder="Type the PIN again" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" required />
         <div class="form-error" id="registerError"></div>
-        <button type="submit" class="btn-action" id="registerBtn" style="width:100%;">Enter Arena Lobby</button>
+        <button type="submit" class="btn-action" id="registerBtn" style="width:100%;">Register &amp; Enter</button>
+      </form>
+
+      <form class="auth-pane" id="paneReset" onsubmit="submitReset(event)">
+        <p class="auth-help">Fill in what you have: your email id <b>and</b> phone number, or your recovery key with your email id or phone number. Then choose a new PIN.</p>
+        <input type="email" id="resetEmailInput" placeholder="Email id" maxlength="120" autocomplete="email" />
+        <input type="tel" id="resetPhoneInput" placeholder="Phone number" maxlength="20" autocomplete="tel" />
+        <input type="text" id="resetKeyInput" placeholder="Recovery key (e.g. K7QM-3XWD-P9TA), if you saved it" maxlength="20" autocomplete="off" />
+        <input type="password" id="resetPinInput" placeholder="New PIN (4 to 6 digits)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" required />
+        <input type="password" id="resetPin2Input" placeholder="Type the new PIN again" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" required />
+        <div class="form-error" id="resetError"></div>
+        <button type="submit" class="btn-action" id="resetBtn" style="width:100%;">Reset PIN &amp; Enter</button>
       </form>
       <div class="form-note">Play chips only, no real money. Your email id and phone number are never shown to other players.</div>
     </div>
@@ -224,6 +275,7 @@
       <div style="display: flex; gap: 8px;">
         <button class="btn-action" style="background: #eab308; color: #000;" onclick="openLeaderboard()">🏆 Leaderboard</button>
         <button class="btn-action" onclick="fetchTables()">🔄 Refresh</button>
+        <button class="btn-action" style="background: #475569;" onclick="signOut()">Sign out</button>
       </div>
     </div>
     <div class="table-grid" id="tablesGrid"></div>
@@ -279,6 +331,8 @@
         </form>
       </div>
     </div>
+
+    <div id="reviewPanel" aria-live="polite"></div>
   </div>
 
   <script>
@@ -443,7 +497,82 @@
     function signOut() {
       authToken = localPlayerId = localPlayerName = null;
       store("poker_token", null); store("poker_pid", null); store("poker_name", null);
+      showAuthPane("login");
       document.getElementById("registerOverlay").style.display = "flex";
+    }
+
+    function showAuthPane(which) {
+      [["login", "tabLogin", "paneLogin"], ["register", "tabRegister", "paneRegister"], ["reset", "tabReset", "paneReset"]]
+        .forEach(([key, tab, pane]) => {
+          document.getElementById(tab).classList.toggle("on", key === which);
+          document.getElementById(pane).classList.toggle("on", key === which);
+        });
+      ["loginError", "registerError", "resetError"].forEach(id => { document.getElementById(id).innerText = ""; });
+    }
+
+    // Shared by sign in / register / reset: POST, save the token, show a new recovery key once.
+    async function authRequest(path, body, errBox, btn) {
+      unlockAudioContext();
+      btn.disabled = true;
+      try {
+        const res = await fetch(`${API}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (!res.ok) { errBox.innerText = data.error || "Could not sign in. Try again."; return; }
+        authToken = data.token;
+        store("poker_token", authToken);
+        document.querySelectorAll("#registerOverlay input[type=password]").forEach(i => { i.value = ""; });
+        enterLobby(data);
+        if (data.recovery_key) showRecoveryKey(data.recovery_key);
+      } catch (err) {
+        errBox.innerText = "The poker server is offline right now. Please try again later.";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function showRecoveryKey(key) {
+      document.getElementById("modalTitle").innerText = "🔑 Save your recovery key";
+      document.getElementById("modalContent").innerHTML = `
+        <p style="color:#cbd5e1; font-size:14px;">If you forget your PIN, this key (with your email id or phone number) lets you choose a new one. It is shown only now: write it down or take a screenshot.</p>
+        <div class="recovery-key">${esc(key)}</div>`;
+      document.getElementById("modalOverlay").style.display = "flex";
+    }
+
+    function pinOk(pin, pin2, errBox) {
+      if (!/^\d{4,6}$/.test(pin)) { errBox.innerText = "The PIN must be 4 to 6 digits."; return false; }
+      if (pin2 !== undefined && pin !== pin2) { errBox.innerText = "The two PINs are not the same."; return false; }
+      return true;
+    }
+
+    function submitLogin(e) {
+      if (e) e.preventDefault();
+      const errBox = document.getElementById("loginError");
+      const id = document.getElementById("loginIdInput").value.trim();
+      const pin = document.getElementById("loginPinInput").value.trim();
+      errBox.innerText = "";
+      if (!id) { errBox.innerText = "Enter your email id or phone number."; return; }
+      if (!pinOk(pin, undefined, errBox)) return;
+      authRequest("/api/login", { id, pin }, errBox, document.getElementById("loginBtn"));
+    }
+
+    function submitReset(e) {
+      if (e) e.preventDefault();
+      const errBox = document.getElementById("resetError");
+      const email = document.getElementById("resetEmailInput").value.trim();
+      const phone = document.getElementById("resetPhoneInput").value.trim();
+      const recovery_key = document.getElementById("resetKeyInput").value.trim();
+      const new_pin = document.getElementById("resetPinInput").value.trim();
+      errBox.innerText = "";
+      if (!((email && phone) || (recovery_key && (email || phone)))) {
+        errBox.innerText = "Fill in your email id and phone number, or your recovery key with one of them.";
+        return;
+      }
+      if (!pinOk(new_pin, document.getElementById("resetPin2Input").value.trim(), errBox)) return;
+      authRequest("/api/reset_pin", { email, phone, recovery_key, new_pin }, errBox, document.getElementById("resetBtn"));
     }
 
     function enterLobby(profile) {
@@ -469,27 +598,13 @@
       const name = document.getElementById("playerNameInput").value.trim();
       const email = document.getElementById("playerEmailInput").value.trim();
       const phone = document.getElementById("playerPhoneInput").value.trim();
+      const pin = document.getElementById("playerPinInput").value.trim();
       errBox.innerText = "";
       if (name.length < 2) { errBox.innerText = "Enter a name (2 to 15 letters)."; return; }
       if (!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(email)) { errBox.innerText = "Enter a valid email id."; return; }
       if (phone.replace(/\D/g, "").length < 8) { errBox.innerText = "Enter a valid phone number."; return; }
-      btn.disabled = true;
-      try {
-        const res = await fetch(`${API}/api/register`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, email, phone })
-        });
-        const data = await res.json();
-        if (!res.ok) { errBox.innerText = data.error || "Could not register. Try again."; return; }
-        authToken = data.token;
-        store("poker_token", authToken);
-        enterLobby(data);
-      } catch (err) {
-        errBox.innerText = "The poker server is offline right now. Please try again later.";
-      } finally {
-        btn.disabled = false;
-      }
+      if (!pinOk(pin, document.getElementById("playerPin2Input").value.trim(), errBox)) return;
+      await authRequest("/api/register", { name, email, phone, pin }, errBox, btn);
     }
 
     async function fetchTables() {
@@ -538,9 +653,40 @@
       currentTableId = null;
       if (ws) { const old = ws; ws = null; old.close(); }
       document.getElementById("arenaView").style.display = "none";
+      document.getElementById("reviewPanel").style.display = "none";
       document.getElementById("lobbyView").style.display = "flex";
       fetchTables();
     }
+
+    // 60-second after-hand review: every player's cards, best hand and a right/wrong verdict.
+    function miniCard(card, unplayed) {
+      const fmt = formatCard(card);
+      return `<span class="mini-card${fmt.isRed ? " red" : ""}${unplayed ? " unplayed" : ""}">${esc(fmt.text)}</span>`;
+    }
+    function renderReview() {
+      const panel = document.getElementById("reviewPanel");
+      const r = gameState.stage === "SHOWDOWN" ? gameState.review : null;
+      if (!r || !r.players || !r.players.length) { panel.style.display = "none"; return; }
+      const board = (r.board || []).map((c, i) => miniCard(c, i >= r.played)).join("");
+      const note = r.played < (r.board || []).length
+        ? `<span>(faded cards were not dealt in the hand - shown only to compare)</span>` : "";
+      const rows = r.players.map(p => `
+        <div class="review-row${p.id === localPlayerId ? " me" : ""}">
+          <b>${esc(p.name)}${p.id === localPlayerId ? " (You)" : ""}</b>
+          <span class="review-cards">${(p.cards || []).map(c => miniCard(c, false)).join("")}</span>
+          <span class="verdict ${p.right ? "verdict-right" : "verdict-wrong"}">${p.right ? "✔" : "✘"} ${esc(p.verdict)}</span>
+        </div>`).join("");
+      panel.innerHTML = `
+        <h3><span>🔍 Hand #${esc(r.hand_no)} review - all cards</span><span style="color:#facc15;">Next hand in ${esc(gameState.review_left)}s</span></h3>
+        <div class="review-board">Board: ${board} ${note}</div>
+        ${rows}`;
+      panel.style.display = "block";
+      if (reviewShownFor !== r.hand_no) {          // bring it into view once per hand
+        reviewShownFor = r.hand_no;
+        try { panel.scrollIntoView({ behavior: "smooth", block: "nearest" }); } catch (e) {}
+      }
+    }
+    let reviewShownFor = null;
 
     function addHouseBot() {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -707,6 +853,7 @@
         updateButtons(me, gameState.is_my_turn);
         updateChatLog(gameState.logs || []);
         drawTable();
+        renderReview();
       };
     }
 

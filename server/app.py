@@ -1,4 +1,6 @@
 ﻿import asyncio
+import hashlib
+import hmac
 import html
 import json
 import random
@@ -47,6 +49,7 @@ TURN_SECONDS = 60
 AWAY_TURN_SECONDS = 5          # a player who lost connection is auto-checked/folded quickly
 DAILY_BONUS_STEP = 100         # day 1 = Rs. 100 ... day 5+ of a streak = Rs. 500
 DAILY_BONUS_MAX_DAYS = 5
+REVIEW_SECONDS = 60            # after every hand: all cards face up for 60 s so everyone can study it
 
 HAND_NAMES = ["High Card", "One Pair", "Two Pair", "Three of a Kind", "Straight",
               "Flush", "Full House", "Four of a Kind", "Straight Flush"]
@@ -91,7 +94,10 @@ def init_db():
         cols = {r[1] for r in cur.execute("PRAGMA table_info(users)")}
         for name, decl in [("email", "TEXT"), ("phone", "TEXT"), ("token", "TEXT"),
                            ("created_at", "INTEGER"), ("last_bonus_day", "TEXT"),
-                           ("streak", "INTEGER NOT NULL DEFAULT 0")]:
+                           ("streak", "INTEGER NOT NULL DEFAULT 0"),
+                           # PIN sign-in (added 07-Nov-2026): hashed PIN + hashed recovery key
+                           ("pin_hash", "TEXT"), ("recovery_hash", "TEXT"),
+                           ("pin_fails", "INTEGER NOT NULL DEFAULT 0"), ("pin_locked_until", "INTEGER")]:
             if name not in cols:
                 cur.execute(f"ALTER TABLE users ADD COLUMN {name} {decl}")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
@@ -117,6 +123,67 @@ def clean_phone(raw) -> str:
 def same_phone(a: str, b: str) -> bool:
     da, dbb = re.sub(r"\D", "", a or ""), re.sub(r"\D", "", b or "")
     return bool(da) and da[-10:] == dbb[-10:]
+
+
+PIN_RE = re.compile(r"^\d{4,6}$")
+PIN_MAX_FAILS = 5              # wrong PINs / reset attempts before the account is locked for a while
+PIN_LOCK_SECONDS = 15 * 60
+
+
+def hash_secret(secret: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, 200_000)
+    return salt.hex() + "$" + digest.hex()
+
+
+def check_secret(secret: str, stored: Optional[str]) -> bool:
+    if not stored or "$" not in stored:
+        return False
+    salt_hex, digest_hex = stored.split("$", 1)
+    digest = hashlib.pbkdf2_hmac("sha256", secret.encode(), bytes.fromhex(salt_hex), 200_000)
+    return hmac.compare_digest(digest.hex(), digest_hex)
+
+
+def new_recovery_key() -> str:
+    """12 letters/digits shown once, e.g. K7QM-3XWD-P9TA; used to reset a forgotten PIN."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    raw = "".join(secrets.choice(alphabet) for _ in range(12))
+    return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
+
+
+def clean_recovery_key(raw) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", str(raw or "")).upper()
+
+
+def find_user_row(conn, email: str = "", phone: str = ""):
+    """Looks a player up by email id, else by phone (last 10 digits). Returns (row, error)."""
+    cols = "player_id, email, phone, pin_hash, recovery_hash, pin_fails, pin_locked_until, token"
+    if email:
+        row = conn.execute(f"SELECT {cols} FROM users WHERE email = ?", (email,)).fetchone()
+        return row, None if row else "No player is registered with this email id."
+    if phone:
+        rows = [r for r in conn.execute(f"SELECT {cols} FROM users WHERE phone IS NOT NULL").fetchall()
+                if same_phone(r[2], phone)]
+        if len(rows) > 1:
+            return None, "More than one player uses this phone number. Please use your email id."
+        return (rows[0], None) if rows else (None, "No player is registered with this phone number.")
+    return None, "Enter your email id or phone number."
+
+
+def locked_message(row) -> Optional[str]:
+    until = row[6] or 0
+    if until > time.time():
+        minutes = max(1, int((until - time.time()) // 60) + 1)
+        return f"Too many wrong tries. Please wait {minutes} min and try again."
+    return None
+
+
+def note_failure(conn, player_id: str, fails: int):
+    fails += 1
+    locked = int(time.time()) + PIN_LOCK_SECONDS if fails >= PIN_MAX_FAILS else None
+    conn.execute("UPDATE users SET pin_fails = ?, pin_locked_until = ? WHERE player_id = ?",
+                 (0 if locked else fails, locked, player_id))
+    conn.commit()
 
 
 def user_by_token(token: str) -> Optional[Tuple[str, str]]:
@@ -276,6 +343,8 @@ class PokerTable:
         self.acted_players = set()
         self.winner_banner = ""
         self.last_chat_ts: Dict[str, float] = {}
+        self.review: dict = {}
+        self.review_left = 0
 
     # ---- small helpers
     def add_log(self, text: str, sender: str = "DEALER"):
@@ -442,7 +511,7 @@ class PokerTable:
         for pid, ws in list(self.connections.items()):
             sanitized = []
             for p in players:
-                show = p["id"] == pid or (self.stage == "SHOWDOWN" and not p["folded"])
+                show = p["id"] == pid or (self.stage == "SHOWDOWN" and bool(p["cards"]))
                 sanitized.append({
                     "id": p["id"], "name": p["name"], "chips": p["chips"],
                     "hands_won": p.get("hands_won", 0), "seat": p["seat"],
@@ -474,6 +543,8 @@ class PokerTable:
                 "is_my_turn": is_my_turn,
                 "sound_event": sound_event,
                 "logs": self.action_logs[-20:],
+                "review": self.review if self.stage == "SHOWDOWN" else None,
+                "review_left": self.review_left if self.stage == "SHOWDOWN" else 0,
             }
             try:
                 await ws.send_text(json.dumps(payload))
@@ -568,6 +639,7 @@ class PokerTable:
         self.hand_no += 1
         self.stage = "PREFLOP"
         self.winner_banner = ""
+        self.review = {}
         self.deck = Deck()
         self.community_cards = []
         self.acted_players.clear()
@@ -853,6 +925,7 @@ class PokerTable:
 
         paid = 0
         summary = []
+        winner_ids = set()
         best = max(alive, key=lambda p: p["hand_score"]) if alive else None
         for idx, sub in enumerate(pots):
             cands = [p for p in alive if p["id"] in sub["eligible"]]
@@ -865,6 +938,7 @@ class PokerTable:
                 won = share + (odd if i == 0 else 0)
                 w["chips"] += won
                 paid += won
+                winner_ids.add(w["id"])
                 update_user_chips(w["id"], w["chips"])
                 summary.append(f"{w['name']} won Rs. {won} (Pot {idx + 1}: {w['hand_desc']})")
         leftover = self.pot - paid
@@ -873,9 +947,10 @@ class PokerTable:
             update_user_chips(best["id"], best["chips"])
 
         reason = " | ".join(summary) if summary else "Showdown"
-        await self.finish_hand(best, reason, already_paid=True)
+        await self.finish_hand(best, reason, already_paid=True, winner_ids=winner_ids, showdown=True)
 
-    async def finish_hand(self, winner: Optional[dict], reason: str, already_paid: bool = False):
+    async def finish_hand(self, winner: Optional[dict], reason: str, already_paid: bool = False,
+                          winner_ids: Optional[set] = None, showdown: bool = False):
         self.cancel_turn_timer()
         self.turn_seq += 1
         self.stage = "SHOWDOWN"
@@ -898,11 +973,69 @@ class PokerTable:
 
         if self.reset_task and not self.reset_task.done() and self.reset_task is not asyncio.current_task():
             self.reset_task.cancel()
-        self.reset_task = asyncio.create_task(self.auto_reset_countdown(7))
+        try:
+            self.review = self.build_review(set(winner_ids or ([winner["id"]] if winner else [])), showdown)
+        except Exception as e:                  # the review must never stop the next hand
+            print(f"[{self.table_id}] review error: {e!r}")
+            self.review = {}
+        self.reset_task = asyncio.create_task(self.auto_reset_countdown(REVIEW_SECONDS))
+
+    def build_review(self, winner_ids: set, showdown: bool) -> dict:
+        """Every dealt player's cards and what they would have made on the full board, with a
+        plain verdict, so each player can see where their decision was right or wrong.
+        If the hand stopped early, the rest of the board is the real next cards of the deck
+        (shown only for study; nothing is paid on them)."""
+        dealt = [p for p in self.players.values() if p["cards"]]
+        played = list(self.community_cards)
+        missing = max(0, 5 - len(played))
+        extra = [str(c) for c in self.deck.cards[:missing]] if (self.deck and missing) else []
+        board = played + extra
+        scores = {p["id"]: hand_score(p["cards"] + board) for p in dealt}
+        best = max(scores.values()) if scores else None
+        best_players = [p for p in dealt if scores[p["id"]] == best]
+        best_names = " & ".join(p["name"] for p in best_players)
+        best_hand = HAND_NAMES[best[0]] if best and best[0] >= 0 else ""
+
+        winners = [p for p in dealt if p["id"] in winner_ids]
+        win_names = " & ".join(p["name"] for p in winners)
+        win_hand = ""
+        if winners:
+            ws = max(scores[p["id"]] for p in winners)
+            win_hand = HAND_NAMES[ws[0]] if ws[0] >= 0 else ""
+
+        rows = []
+        for p in sorted(dealt, key=lambda x: x["seat"]):
+            sc = scores[p["id"]]
+            hand = HAND_NAMES[sc[0]] if sc[0] >= 0 else ""
+            would_win = sc == best
+            if p["id"] in winner_ids:
+                result = "won"
+                if showdown:
+                    verdict, right = f"Won with {hand}.", True
+                    if not would_win:
+                        verdict += f" ({best_names} folded a better hand: {best_hand}.)"
+                elif would_win:
+                    verdict, right = f"Won - everyone folded. {hand} was the best hand anyway.", True
+                else:
+                    verdict, right = (f"Won - everyone folded. Bluff worked: {best_names} would have won "
+                                      f"with {best_hand}."), True
+            elif p["folded"]:
+                result = "folded"
+                if would_win:
+                    verdict, right = f"Fold was a mistake: your {hand} would have won.", False
+                else:
+                    verdict, right = f"Fold was right: {best_names} would have won with {best_hand}.", True
+            else:
+                result = "lost"
+                verdict, right = f"Lost: your {hand} lost to {win_names}'s {win_hand}.", False
+            rows.append({"id": p["id"], "seat": p["seat"], "name": p["name"], "cards": p["cards"], "hand": hand,
+                         "result": result, "verdict": verdict, "right": right})
+        return {"hand_no": self.hand_no, "board": board, "played": len(played), "players": rows}
 
     async def auto_reset_countdown(self, seconds: int):
         try:
             for remaining in range(seconds, 0, -1):
+                self.review_left = remaining
                 await self.broadcast_state(f"{self.winner_banner} — Next in {remaining}s...",
                                            sound_event="win" if remaining == seconds else None)
                 await asyncio.sleep(1)
@@ -941,44 +1074,154 @@ async def health():
     return {"ok": True, "tables": len(TABLES)}
 
 
-@app.post("/api/register")
-async def register(request: Request):
-    """Sign up (name + email + phone) or sign back in (same email + phone)."""
+def bad(msg: str, status: int = 400) -> JSONResponse:
+    return JSONResponse({"error": msg}, status_code=status)
+
+
+async def read_json(request: Request) -> Optional[dict]:
     try:
         data = await request.json()
     except Exception:
-        return JSONResponse({"error": "Bad request."}, status_code=400)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def signed_in(player_id: str, token: str, recovery_key: Optional[str] = None) -> dict:
+    profile = profile_with_daily_bonus(player_id)
+    profile["token"] = token
+    if recovery_key:
+        profile["recovery_key"] = recovery_key      # shown once; only its hash is kept
+    return profile
+
+
+@app.post("/api/register")
+async def register(request: Request):
+    """Sign up with name + email + phone + PIN. Players registered before PINs existed
+    use this once (same email + phone) to set their PIN."""
+    data = await read_json(request)
+    if data is None:
+        return bad("Bad request.")
     name = clean_name(data.get("name"))
     email = str(data.get("email") or "").strip().lower()[:120]
     phone = clean_phone(data.get("phone"))
+    pin = str(data.get("pin") or "").strip()
     if len(name) < 2:
-        return JSONResponse({"error": "Enter a name (2 to 15 letters)."}, status_code=400)
+        return bad("Enter a name (2 to 15 letters).")
     if not EMAIL_RE.match(email):
-        return JSONResponse({"error": "Enter a valid email id."}, status_code=400)
+        return bad("Enter a valid email id.")
     if not phone:
-        return JSONResponse({"error": "Enter a valid phone number (8 to 15 digits)."}, status_code=400)
+        return bad("Enter a valid phone number (8 to 15 digits).")
+    if not PIN_RE.match(pin):
+        return bad("Choose a PIN of 4 to 6 digits.")
 
+    recovery = new_recovery_key()
     conn = db()
     try:
-        row = conn.execute("SELECT player_id, phone, token FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute("SELECT player_id, phone, token, pin_hash FROM users WHERE email = ?", (email,)).fetchone()
         if row:
+            if row[3]:
+                return bad("This email id is already registered. Use Sign in with your PIN, or Forgot PIN.", 409)
             if not same_phone(row[1], phone):
-                return JSONResponse({"error": "This email id is already registered with a different phone number."},
-                                    status_code=409)
+                return bad("This email id is already registered with a different phone number.", 409)
             player_id, token = row[0], row[2] or secrets.token_urlsafe(24)
-            conn.execute("UPDATE users SET player_name = ?, token = ? WHERE player_id = ?", (name, token, player_id))
+            conn.execute("""UPDATE users SET player_name = ?, token = ?, pin_hash = ?, recovery_hash = ?,
+                                             pin_fails = 0, pin_locked_until = NULL WHERE player_id = ?""",
+                         (name, token, hash_secret(pin), hash_secret(clean_recovery_key(recovery)), player_id))
         else:
             player_id, token = "u_" + secrets.token_hex(6), secrets.token_urlsafe(24)
             conn.execute("""INSERT INTO users (player_id, player_name, chips, hands_played, hands_won, total_winnings,
-                                               email, phone, token, created_at, streak)
-                            VALUES (?, ?, ?, 0, 0, 0, ?, ?, ?, ?, 0)""",
-                         (player_id, name, START_CHIPS, email, phone, token, int(time.time())))
+                                               email, phone, token, created_at, streak, pin_hash, recovery_hash)
+                            VALUES (?, ?, ?, 0, 0, 0, ?, ?, ?, ?, 0, ?, ?)""",
+                         (player_id, name, START_CHIPS, email, phone, token, int(time.time()),
+                          hash_secret(pin), hash_secret(clean_recovery_key(recovery))))
         conn.commit()
     finally:
         conn.close()
-    profile = profile_with_daily_bonus(player_id)
-    profile["token"] = token
-    return profile
+    return signed_in(player_id, token, recovery)
+
+
+@app.post("/api/login")
+async def login(request: Request):
+    """Sign back in with email id (or phone number) + PIN."""
+    data = await read_json(request)
+    if data is None:
+        return bad("Bad request.")
+    ident = str(data.get("id") or "").strip()
+    pin = str(data.get("pin") or "").strip()
+    email = ident.lower()[:120] if "@" in ident else ""
+    phone = "" if email else clean_phone(ident)
+    if not email and not phone:
+        return bad("Enter your email id or phone number.")
+    if not PIN_RE.match(pin):
+        return bad("Enter your 4 to 6 digit PIN.")
+    conn = db()
+    try:
+        row, err = find_user_row(conn, email, phone)
+        if not row:
+            return bad(err, 404)
+        if not row[3]:
+            return bad("This account has no PIN yet. Use Register once with the same email id and phone number "
+                       "to choose your PIN.", 409)
+        locked = locked_message(row)
+        if locked:
+            return bad(locked, 429)
+        if not check_secret(pin, row[3]):
+            note_failure(conn, row[0], row[5] or 0)
+            return bad("Wrong PIN.", 401)
+        token = row[7] or secrets.token_urlsafe(24)
+        conn.execute("UPDATE users SET token = ?, pin_fails = 0, pin_locked_until = NULL WHERE player_id = ?",
+                     (token, row[0]))
+        conn.commit()
+    finally:
+        conn.close()
+    return signed_in(row[0], token)
+
+
+@app.post("/api/reset_pin")
+async def reset_pin(request: Request):
+    """Forgot PIN: prove the account with whatever the player has -
+    email id + phone number, or recovery key + email id / phone number."""
+    data = await read_json(request)
+    if data is None:
+        return bad("Bad request.")
+    email = str(data.get("email") or "").strip().lower()[:120]
+    phone_raw = str(data.get("phone") or "").strip()
+    phone = clean_phone(phone_raw) if phone_raw else ""
+    key = clean_recovery_key(data.get("recovery_key"))
+    new_pin = str(data.get("new_pin") or "").strip()
+    if email and not EMAIL_RE.match(email):
+        return bad("Enter a valid email id.")
+    if phone_raw and not phone:
+        return bad("Enter a valid phone number (8 to 15 digits).")
+    if not PIN_RE.match(new_pin):
+        return bad("Choose a new PIN of 4 to 6 digits.")
+    if not ((email and phone) or (key and (email or phone))):
+        return bad("Fill in your email id and phone number, or your recovery key with one of them.")
+    conn = db()
+    try:
+        row, err = find_user_row(conn, email, phone)
+        if not row:
+            return bad(err, 404)
+        locked = locked_message(row)
+        if locked:
+            return bad(locked, 429)
+        proofs = []
+        if email and phone:
+            proofs.append(same_phone(row[2], phone))
+        if key:
+            proofs.append(check_secret(key, row[4]))
+        if not any(proofs):
+            note_failure(conn, row[0], row[5] or 0)
+            return bad("Those details do not match this account.", 401)
+        recovery = new_recovery_key()
+        token = secrets.token_urlsafe(24)          # new token: other signed-in devices must sign in again
+        conn.execute("""UPDATE users SET pin_hash = ?, recovery_hash = ?, token = ?, pin_fails = 0,
+                                         pin_locked_until = NULL WHERE player_id = ?""",
+                     (hash_secret(new_pin), hash_secret(clean_recovery_key(recovery)), token, row[0]))
+        conn.commit()
+    finally:
+        conn.close()
+    return signed_in(row[0], token, recovery)
 
 
 @app.get("/api/me")
