@@ -154,6 +154,10 @@
     .auth-tabs button.on { background: #0284c7; color: #fff; border-color: #38bdf8; }
     .auth-pane { display: none; }
     .auth-pane.on { display: block; }
+    .otp-box { display: none; text-align: left; }
+    .otp-box.on { display: block; }
+    .otp-note { color: #4ade80; font-size: 13px; margin: 0 0 8px; }
+    .link-btn { background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 13px; padding: 0 0 10px; text-decoration: underline; }
     .auth-help { color: #94a3b8; font-size: 13px; margin: 0 0 14px; text-align: left; }
     .recovery-key { font: bold 22px monospace; letter-spacing: 2px; color: #facc15; background: #030712; border: 1px dashed #facc15; border-radius: 8px; padding: 12px; margin: 12px 0; user-select: all; }
 
@@ -233,17 +237,27 @@
         <input type="tel" id="playerPhoneInput" placeholder="Phone number (with country code)" maxlength="20" autocomplete="tel" required />
         <input type="password" id="playerPinInput" placeholder="PIN, optional (4 to 6 digits)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" />
         <input type="password" id="playerPin2Input" placeholder="Type the PIN again (only if you added one)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" />
+        <div class="otp-box" id="registerOtpBox">
+          <p class="otp-note" id="registerOtpNote"></p>
+          <input type="text" id="registerOtpInput" placeholder="6-digit code from your email" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
+          <button type="button" class="link-btn" onclick="resendCode('register')">Send a new code</button>
+        </div>
         <div class="form-error" id="registerError"></div>
         <button type="submit" class="btn-action" id="registerBtn" style="width:100%;">Enter Arena Lobby</button>
       </form>
 
       <form class="auth-pane" id="paneReset" onsubmit="submitReset(event)">
-        <p class="auth-help">Fill in what you have: your email id <b>and</b> phone number, or your recovery key with your email id or phone number. Then choose a new PIN.</p>
+        <p class="auth-help" id="resetHelp">Fill in what you have: your email id <b>and</b> phone number, or your recovery key with your email id or phone number. Then choose a new PIN.</p>
         <input type="email" id="resetEmailInput" placeholder="Email id" maxlength="120" autocomplete="email" />
         <input type="tel" id="resetPhoneInput" placeholder="Phone number" maxlength="20" autocomplete="tel" />
         <input type="text" id="resetKeyInput" placeholder="Recovery key (e.g. K7QM-3XWD-P9TA), if you saved it" maxlength="20" autocomplete="off" />
         <input type="password" id="resetPinInput" placeholder="New PIN (4 to 6 digits)" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" required />
         <input type="password" id="resetPin2Input" placeholder="Type the new PIN again" inputmode="numeric" pattern="\d{4,6}" maxlength="6" autocomplete="new-password" required />
+        <div class="otp-box" id="resetOtpBox">
+          <p class="otp-note" id="resetOtpNote"></p>
+          <input type="text" id="resetOtpInput" placeholder="6-digit code from your email" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
+          <button type="button" class="link-btn" onclick="resendCode('reset')">Send a new code</button>
+        </div>
         <div class="form-error" id="resetError"></div>
         <button type="submit" class="btn-action" id="resetBtn" style="width:100%;">Reset PIN &amp; Enter</button>
       </form>
@@ -491,6 +505,20 @@
       return { text: `${rank}${suitMap[suit] || suit}`, isRed: (suit === 'h' || suit === 'd') };
     }
 
+    // Email codes on: Forgot PIN needs only the email id (a code is emailed) or the recovery key.
+    let emailOtpOn = false;
+    async function loadAuthInfo() {
+      try {
+        const info = await (await fetch(`${API}/api/auth_info`)).json();
+        emailOtpOn = !!info.email_otp;
+      } catch (e) { return; }
+      if (emailOtpOn) {
+        document.getElementById("resetHelp").innerHTML = "Enter your email id and we email you a code, or use your recovery key with your email id or phone number. Then choose a new PIN.";
+        document.getElementById("resetPhoneInput").placeholder = "Phone number (only with a recovery key)";
+      }
+    }
+    loadAuthInfo();
+
     window.addEventListener("DOMContentLoaded", async () => {
       if (!authToken) return;
       try {
@@ -519,6 +547,7 @@
           document.getElementById(pane).classList.toggle("on", key === which);
         });
       ["loginError", "registerError", "resetError"].forEach(id => { document.getElementById(id).innerText = ""; });
+      hideCode("register"); hideCode("reset");
     }
 
     // Shared by sign in / register / reset: POST, save the token, show a new recovery key once.
@@ -529,13 +558,15 @@
         const res = await fetch(`${API}${path}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
+          body: JSON.stringify(Object.assign({}, body, { pane: undefined }))
         });
         const data = await res.json();
         if (!res.ok) { errBox.innerText = data.error || "Could not sign in. Try again."; return; }
+        if (data.otp_sent && body.pane) { showCode(body.pane, data.message); return; }
         authToken = data.token;
         store("poker_token", authToken);
         document.querySelectorAll("#registerOverlay input[type=password]").forEach(i => { i.value = ""; });
+        hideCode("register"); hideCode("reset");
         enterLobby(data);
         if (data.recovery_key) showRecoveryKey(data.recovery_key);
       } catch (err) {
@@ -543,6 +574,26 @@
       } finally {
         btn.disabled = false;
       }
+    }
+
+    function showCode(pane, message) {
+      document.getElementById(`${pane}OtpBox`).classList.add("on");
+      document.getElementById(`${pane}OtpNote`).innerText = message || "We emailed you a 6-digit code. Enter it below.";
+      const input = document.getElementById(`${pane}OtpInput`);
+      input.value = "";
+      input.focus();
+    }
+    function hideCode(pane) {
+      document.getElementById(`${pane}OtpBox`).classList.remove("on");
+      document.getElementById(`${pane}OtpInput`).value = "";
+    }
+    function codeFor(pane) {
+      return document.getElementById(`${pane}OtpBox`).classList.contains("on")
+        ? document.getElementById(`${pane}OtpInput`).value.trim() : "";
+    }
+    function resendCode(pane) {
+      hideCode(pane);                    // an empty code asks the server for a new one
+      if (pane === "register") submitRegistration(); else submitReset();
     }
 
     function showRecoveryKey(key) {
@@ -578,12 +629,16 @@
       const recovery_key = document.getElementById("resetKeyInput").value.trim();
       const new_pin = document.getElementById("resetPinInput").value.trim();
       errBox.innerText = "";
-      if (!((email && phone) || (recovery_key && (email || phone)))) {
-        errBox.innerText = "Fill in your email id and phone number, or your recovery key with one of them.";
+      const enough = recovery_key ? (email || phone) : (emailOtpOn ? email : (email && phone));
+      if (!enough) {
+        errBox.innerText = emailOtpOn
+          ? "Enter your email id (we email you a code), or your recovery key with your email id or phone number."
+          : "Fill in your email id and phone number, or your recovery key with one of them.";
         return;
       }
       if (!pinOk(new_pin, document.getElementById("resetPin2Input").value.trim(), errBox)) return;
-      authRequest("/api/reset_pin", { email, phone, recovery_key, new_pin }, errBox, document.getElementById("resetBtn"));
+      authRequest("/api/reset_pin", { email, phone, recovery_key, new_pin, otp: codeFor("reset"), pane: "reset" },
+                  errBox, document.getElementById("resetBtn"));
     }
 
     function enterLobby(profile) {
@@ -615,7 +670,7 @@
       if (!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(email)) { errBox.innerText = "Enter a valid email id."; return; }
       if (phone.replace(/\D/g, "").length < 8) { errBox.innerText = "Enter a valid phone number."; return; }
       if (pin && !pinOk(pin, document.getElementById("playerPin2Input").value.trim(), errBox)) return;
-      await authRequest("/api/register", { name, email, phone, pin }, errBox, btn);
+      await authRequest("/api/register", { name, email, phone, pin, otp: codeFor("register"), pane: "register" }, errBox, btn);
     }
 
     async function fetchTables() {

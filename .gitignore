@@ -2,3 +2,4 @@
 poker_arena.db*
 logs/
 __pycache__/
+email_otp.json

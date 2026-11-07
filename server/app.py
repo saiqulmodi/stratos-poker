@@ -1,5 +1,6 @@
 ﻿import asyncio
 import hashlib
+import smtplib
 import hmac
 import html
 import json
@@ -9,6 +10,7 @@ import secrets
 import sqlite3
 import sys
 import time
+from email.message import EmailMessage
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -100,6 +102,17 @@ def init_db():
                            ("pin_fails", "INTEGER NOT NULL DEFAULT 0"), ("pin_locked_until", "INTEGER")]:
             if name not in cols:
                 cur.execute(f"ALTER TABLE users ADD COLUMN {name} {decl}")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS email_otps (
+                email TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                sent_at INTEGER NOT NULL,
+                hour_start INTEGER NOT NULL,
+                hour_count INTEGER NOT NULL DEFAULT 0
+            );
+        """)
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_token ON users(token)")
         conn.commit()
@@ -184,6 +197,124 @@ def note_failure(conn, player_id: str, fails: int):
     conn.execute("UPDATE users SET pin_fails = ?, pin_locked_until = ? WHERE player_id = ?",
                  (0 if locked else fails, locked, player_id))
     conn.commit()
+
+
+# ---- email OTP (one-time code sent from the owner's Gmail)
+# email_otp.json (never committed) = {"sender": "...@gmail.com", "app_password": "...."}.
+# Made by setup_email_otp.bat. Read on every request, so it works without a restart.
+# While the file is missing, sign-in works as before (email + phone).
+EMAIL_OTP_FILE = BASE_DIR / "email_otp.json"
+OTP_SECONDS = 10 * 60          # a code is valid for 10 minutes
+OTP_RESEND_SECONDS = 60        # one code per email id per minute
+OTP_PER_HOUR = 5               # codes per email id per hour
+OTP_MAX_TRIES = 5              # wrong codes before the code is thrown away
+OTP_GLOBAL_PER_HOUR = 100      # all emails per hour (stays far below Gmail's daily limit)
+_otp_sent_times: List[float] = []
+
+
+def email_otp_config() -> Optional[dict]:
+    try:
+        cfg = json.loads(EMAIL_OTP_FILE.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+    if isinstance(cfg, dict) and EMAIL_RE.match(str(cfg.get("sender", ""))) and cfg.get("app_password"):
+        return cfg
+    return None
+
+
+def send_otp_mail(cfg: dict, to: str, code: str):
+    msg = EmailMessage()
+    msg["Subject"] = f"Stratos Poker code: {code}"
+    msg["From"] = f"Stratos Poker <{cfg['sender']}>"
+    msg["To"] = to
+    msg.set_content(f"Your Stratos Poker code is {code}\n\n"
+                    f"It works for 10 minutes. If you did not ask for it, ignore this email.")
+    with smtplib.SMTP(cfg.get("smtp_host", "smtp.gmail.com"), int(cfg.get("smtp_port", 587)), timeout=20) as s:
+        s.starttls()
+        s.login(cfg["sender"], str(cfg["app_password"]).replace(" ", ""))
+        s.send_message(msg)
+
+
+async def issue_otp(email: str) -> Optional[str]:
+    """Emails a fresh 6-digit code. Returns an error message, or None when sent."""
+    cfg = email_otp_config()
+    if not cfg:
+        return "Email codes are not set up on the server."
+    now = int(time.time())
+    conn = db()
+    try:
+        row = conn.execute("SELECT sent_at, hour_start, hour_count FROM email_otps WHERE email = ?",
+                           (email,)).fetchone()
+        hour_start, hour_count = (row[1], row[2]) if row else (now, 0)
+        if row and now - row[0] < OTP_RESEND_SECONDS:
+            return f"A code was just sent. Please wait {OTP_RESEND_SECONDS - (now - row[0])} s before asking again."
+        if now - hour_start >= 3600:
+            hour_start, hour_count = now, 0
+        if hour_count >= OTP_PER_HOUR:
+            return "Too many codes for this email id. Please try again in an hour."
+    finally:
+        conn.close()
+    _otp_sent_times[:] = [x for x in _otp_sent_times if now - x < 3600]
+    if len(_otp_sent_times) >= OTP_GLOBAL_PER_HOUR:
+        return "The server is busy sending codes. Please try again later."
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    try:
+        await asyncio.to_thread(send_otp_mail, cfg, email, code)
+    except Exception as e:
+        print(f"[otp] email to {email} failed: {e!r}")
+        return "Could not send the email. Please check the email id and try again."
+    _otp_sent_times.append(now)
+    conn = db()
+    try:
+        conn.execute("""INSERT OR REPLACE INTO email_otps (email, code_hash, expires_at, attempts, sent_at,
+                                                           hour_start, hour_count)
+                        VALUES (?, ?, ?, 0, ?, ?, ?)""",
+                     (email, hash_secret(code), now + OTP_SECONDS, now, hour_start, hour_count + 1))
+        conn.commit()
+    finally:
+        conn.close()
+    return None
+
+
+def check_otp(email: str, code: str) -> Optional[str]:
+    """Returns an error message, or None when the code is right (the code is then used up)."""
+    code = re.sub(r"\D", "", str(code or ""))
+    conn = db()
+    try:
+        row = conn.execute("SELECT code_hash, expires_at, attempts FROM email_otps WHERE email = ?",
+                           (email,)).fetchone()
+        if not row or row[0] == "":
+            return "Ask for a new code first."
+        if row[1] < time.time():
+            return "This code has expired. Ask for a new code."
+        if row[2] >= OTP_MAX_TRIES:
+            return "Too many wrong codes. Ask for a new code."
+        if not check_secret(code, row[0]):
+            conn.execute("UPDATE email_otps SET attempts = attempts + 1 WHERE email = ?", (email,))
+            conn.commit()
+            return "Wrong code."
+        conn.execute("UPDATE email_otps SET code_hash = '', expires_at = 0 WHERE email = ?", (email,))
+        conn.commit()
+        return None
+    finally:
+        conn.close()
+
+
+async def otp_step(email: str, code):
+    """Shared by sign-up/sign-in and Forgot PIN. Returns None when the email is proven
+    (or email codes are off), otherwise the response to send back."""
+    if not email_otp_config():
+        return None
+    if not str(code or "").strip():
+        err = await issue_otp(email)
+        if err:
+            busy = "wait" in err or "Too many" in err or "busy" in err
+            return bad(err, 429 if busy else 503)
+        return JSONResponse({"otp_sent": True,
+                             "message": f"We emailed a 6-digit code to {email}. Enter it below."})
+    err = check_otp(email, code)
+    return bad(err, 401) if err else None
 
 
 def user_by_token(token: str) -> Optional[Tuple[str, str]]:
@@ -1114,6 +1245,17 @@ async def register(request: Request):
     if pin and not PIN_RE.match(pin):
         return bad("The PIN must be 4 to 6 digits (or leave it empty).")
 
+    conn = db()
+    try:
+        known = conn.execute("SELECT phone FROM users WHERE email = ?", (email,)).fetchone()
+    finally:
+        conn.close()
+    if known and not same_phone(known[0], phone):
+        return bad("This email id is already registered with a different phone number.", 409)
+    step = await otp_step(email, data.get("otp"))
+    if step is not None:
+        return step
+
     recovery = new_recovery_key() if pin else None
     conn = db()
     try:
@@ -1178,8 +1320,8 @@ async def login(request: Request):
 
 @app.post("/api/reset_pin")
 async def reset_pin(request: Request):
-    """Forgot PIN: prove the account with whatever the player has -
-    email id + phone number, or recovery key + email id / phone number."""
+    """Forgot PIN: prove the account with whatever the player has - a code emailed to the
+    email id (email + phone while email codes are off), or recovery key + email id / phone number."""
     data = await read_json(request)
     if data is None:
         return bad("Bad request.")
@@ -1194,8 +1336,26 @@ async def reset_pin(request: Request):
         return bad("Enter a valid phone number (8 to 15 digits).")
     if not PIN_RE.match(new_pin):
         return bad("Choose a new PIN of 4 to 6 digits.")
-    if not ((email and phone) or (key and (email or phone))):
+    otp_on = email_otp_config() is not None
+    if key and (email or phone):
+        pass                                   # recovery key route, checked below
+    elif otp_on:
+        if not email:
+            return bad("Enter your email id (we email you a code), or use your recovery key.")
+    elif not (email and phone):
         return bad("Fill in your email id and phone number, or your recovery key with one of them.")
+    use_otp = otp_on and not key
+    if use_otp:
+        conn = db()
+        try:
+            known, err = find_user_row(conn, email, "")
+        finally:
+            conn.close()
+        if not known:
+            return bad(err, 404)
+        step = await otp_step(email, data.get("otp"))
+        if step is not None:
+            return step
     conn = db()
     try:
         row, err = find_user_row(conn, email, phone)
@@ -1205,7 +1365,9 @@ async def reset_pin(request: Request):
         if locked:
             return bad(locked, 429)
         proofs = []
-        if email and phone:
+        if use_otp:
+            proofs.append(True)                # the emailed code was checked above
+        elif email and phone and not otp_on:
             proofs.append(same_phone(row[2], phone))
         if key:
             proofs.append(check_secret(key, row[4]))
@@ -1221,6 +1383,11 @@ async def reset_pin(request: Request):
     finally:
         conn.close()
     return signed_in(row[0], token, recovery)
+
+
+@app.get("/api/auth_info")
+async def auth_info():
+    return {"email_otp": email_otp_config() is not None}
 
 
 @app.get("/api/me")
