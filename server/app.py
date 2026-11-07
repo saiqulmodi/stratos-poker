@@ -36,6 +36,7 @@ app.add_middleware(
         "https://stratos.games",
         "https://www.stratos.games",
         "https://stratos-technologies-fzco.github.io",
+        "https://stratos-family-staging.vercel.app",     # Stratos staging (07-Nov-2026)
         "http://localhost:8000",
         "http://127.0.0.1:8000",
     ],
@@ -1279,6 +1280,49 @@ async def register(request: Request):
     finally:
         conn.close()
     return signed_in(player_id, token, recovery)
+
+
+GUEST_PER_HOUR = 300           # new nickname accounts per hour (all players together)
+_guest_created: List[float] = []
+
+
+@app.post("/api/guest")
+async def guest(request: Request):
+    """Stratos version: play with a nickname only (no email, no phone, no code).
+    The token stays in the player's browser; sending it back keeps the same chips
+    and only changes the nickname."""
+    data = await read_json(request)
+    if data is None:
+        return bad("Bad request.")
+    name = clean_name(data.get("name"))
+    if len(name) < 2:
+        return bad("Enter a nickname (2 to 15 letters).")
+    known = user_by_token(str(data.get("token") or ""))
+    conn = db()
+    try:
+        if known:
+            player_id = known[0]
+            token = str(data.get("token"))
+            conn.execute("UPDATE users SET player_name = ? WHERE player_id = ?", (name, player_id))
+        else:
+            now = time.time()
+            _guest_created[:] = [t for t in _guest_created if now - t < 3600]
+            if len(_guest_created) >= GUEST_PER_HOUR:
+                return bad("Too many new players right now. Please try again in a few minutes.", 429)
+            _guest_created.append(now)
+            player_id, token = "g_" + secrets.token_hex(6), secrets.token_urlsafe(24)
+            conn.execute("""INSERT INTO users (player_id, player_name, chips, hands_played, hands_won,
+                                               total_winnings, token, created_at, streak)
+                            VALUES (?, ?, ?, 0, 0, 0, ?, ?, 0)""",
+                         (player_id, name, START_CHIPS, token, int(now)))
+        conn.commit()
+    finally:
+        conn.close()
+    for t in TABLES.values():                  # a seated player's new nickname shows at the table
+        p = t.players.get(player_id)
+        if p:
+            p["name"] = name
+    return signed_in(player_id, token)
 
 
 @app.post("/api/login")

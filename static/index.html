@@ -261,7 +261,14 @@
         <div class="form-error" id="resetError"></div>
         <button type="submit" class="btn-action" id="resetBtn" style="width:100%;">Reset PIN &amp; Enter</button>
       </form>
-      <div class="form-note">Play chips only, no real money. Your email id and phone number are never shown to other players.</div>
+      <!-- Stratos version: nickname only (no email, no phone, no code) -->
+      <form class="auth-pane" id="paneGuest" onsubmit="submitGuest(event)">
+        <p class="auth-help">Pick a nickname and play. Your chips, stats and daily bonus are kept on this device.</p>
+        <input type="text" id="guestNameInput" placeholder="Nickname" maxlength="15" autocomplete="nickname" required />
+        <div class="form-error" id="guestError"></div>
+        <button type="submit" class="btn-action" id="guestBtn" style="width:100%;">Enter Arena Lobby</button>
+      </form>
+      <div class="form-note" id="authNote">Play chips only, no real money. Your email id and phone number are never shown to other players.</div>
     </div>
   </div>
 
@@ -294,7 +301,7 @@
       <div style="display: flex; gap: 8px;">
         <button class="btn-action" style="background: #eab308; color: #000;" onclick="openLeaderboard()">🏆 Leaderboard</button>
         <button class="btn-action" onclick="fetchTables()">🔄 Refresh</button>
-        <button class="btn-action" style="background: #475569;" onclick="signOut()">Sign out</button>
+        <button class="btn-action" style="background: #475569;" id="signOutBtn" onclick="signOut()">Sign out</button>
       </div>
     </div>
     <div class="table-grid" id="tablesGrid"></div>
@@ -376,6 +383,9 @@
     const servedByServer = location.hostname.endsWith(".ts.net") || location.hostname === "localhost" || location.hostname === "127.0.0.1";
     const API = servedByServer ? "" : SERVER;
     const WS_BASE = servedByServer ? `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}` : SERVER.replace(/^http/, "ws");
+    // Stratos (any page not served by this server) = nickname only, no email or phone (Stratos rule, 07-Nov-2026).
+    // The owner's own link (Funnel / localhost) keeps email + phone + email code + PIN.
+    const GUEST_MODE = !servedByServer || new URLSearchParams(location.search).has("nickname");
 
     function store(key, value) {
       try { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch (e) {}
@@ -533,7 +543,32 @@
       }
     });
 
+    function setupGuestMode() {
+      if (!GUEST_MODE) return;
+      document.querySelector("#registerOverlay .auth-tabs").style.display = "none";
+      ["paneLogin", "paneRegister", "paneReset"].forEach(id => document.getElementById(id).classList.remove("on"));
+      document.getElementById("paneGuest").classList.add("on");
+      document.getElementById("authNote").innerText = "Play chips only, no real money.";
+      document.getElementById("signOutBtn").innerText = "✏️ Change name";
+    }
+    setupGuestMode();
+
+    function submitGuest(e) {
+      if (e) e.preventDefault();
+      const errBox = document.getElementById("guestError");
+      const name = document.getElementById("guestNameInput").value.trim();
+      errBox.innerText = "";
+      if (name.length < 2) { errBox.innerText = "Enter a nickname (2 to 15 letters)."; return; }
+      authRequest("/api/guest", { name, token: authToken || "" }, errBox, document.getElementById("guestBtn"));
+    }
+
     function signOut() {
+      if (GUEST_MODE) {                  // keep the token, so the same chips stay with the new nickname
+        document.getElementById("guestNameInput").value = localPlayerName || "";
+        document.getElementById("guestError").innerText = "";
+        document.getElementById("registerOverlay").style.display = "flex";
+        return;
+      }
       authToken = localPlayerId = localPlayerName = null;
       store("poker_token", null); store("poker_pid", null); store("poker_name", null);
       showAuthPane("register");
@@ -567,7 +602,8 @@
         store("poker_token", authToken);
         document.querySelectorAll("#registerOverlay input[type=password]").forEach(i => { i.value = ""; });
         hideCode("register"); hideCode("reset");
-        track(path === "/api/login" ? "pin_signin" : path === "/api/reset_pin" ? "pin_reset" : "signin", { level: data.recovery_key ? "pin_added" : "no_pin" });
+        track(path === "/api/login" ? "pin_signin" : path === "/api/reset_pin" ? "pin_reset" : "signin",
+              { level: path === "/api/guest" ? "nickname" : data.recovery_key ? "pin_added" : "no_pin" });
         enterLobby(data);
         if (data.recovery_key) showRecoveryKey(data.recovery_key);
       } catch (err) {
