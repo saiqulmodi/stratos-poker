@@ -83,23 +83,20 @@ The project has evolved from a single-table prototype into a multi-table, real-t
 
 ---
 
-## 4. How to Resume When Ready
+## 4. Running 24/7 (no manual steps)
 
-1. Open PowerShell and navigate to the project directory:
-```powershell
-Set-Location "C:\Users\saiqu\projects\stratos-poker"
+* Scheduled task **`StratosPoker_Server`** (at logon + every 10 minutes, allowed on battery) starts `run_server_24_7.ps1` hidden.
+* The watchdog runs the server on `127.0.0.1:8000`, restarts it if it stops or stops answering `/api/health`, and never stops any program it did not start.
+* It keeps the Tailscale Funnel route `https://modi.tail3f4d21.ts.net` -> `127.0.0.1:8000`; it only adds the route when Tailscale has no other serve/funnel config.
+* Logs: `logs/watchdog.log`, `logs/server.err.log`.
+* Play: `http://localhost:8000`, `https://modi.tail3f4d21.ts.net`, or the stratos.games box `games/saiqulmodi-stratos-poker` (same page, talks to the Funnel address).
 
-```
+## 5. Registration and analytics
 
-
-2. Start the Uvicorn server:
-```powershell
-python -m uvicorn server.app:app --host 0.0.0.0 --port 8000
-
-```
-
-
-3. Open `http://localhost:8000` or your Tailscale public link.
+* Players register with name, email id and phone number (`POST /api/register`); the same email id + phone number signs back in. The server gives a token kept in the browser; every table socket needs it.
+* Email ids and phone numbers stay in `poker_arena.db` on this laptop (never committed, never shown to other players).
+* Daily bonus: Rs. 100 x streak day (max Rs. 500) on the first visit of each day.
+* Stratos analytics: `level_start` when a hand is dealt to the player, `level_complete` (stack grew) or `game_over` with `seconds` and `score` (chips), plus `reward_offered` / `reward_taken` on reload and `daily_bonus`. No personal data in events.
 
 ---
 

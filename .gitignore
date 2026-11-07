@@ -1,0 +1,4 @@
+# Player database holds names, email ids and phone numbers: never commit it
+poker_arena.db*
+logs/
+__pycache__/
