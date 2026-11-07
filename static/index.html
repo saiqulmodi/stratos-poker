@@ -567,6 +567,7 @@
         store("poker_token", authToken);
         document.querySelectorAll("#registerOverlay input[type=password]").forEach(i => { i.value = ""; });
         hideCode("register"); hideCode("reset");
+        track(path === "/api/login" ? "pin_signin" : path === "/api/reset_pin" ? "pin_reset" : "signin", { level: data.recovery_key ? "pin_added" : "no_pin" });
         enterLobby(data);
         if (data.recovery_key) showRecoveryKey(data.recovery_key);
       } catch (err) {
@@ -750,6 +751,8 @@
       panel.style.display = "block";
       if (reviewShownFor !== r.hand_no) {          // bring it into view once per hand
         reviewShownFor = r.hand_no;
+        const mine = r.players.find(p => p.id === localPlayerId);
+        if (mine) track("hand_review", { level: mine.result + (mine.right ? "_right" : "_wrong") });
         try { panel.scrollIntoView({ behavior: "smooth", block: "nearest" }); } catch (e) {}
       }
     }
@@ -769,10 +772,12 @@
     function chooseAiPlayer() {
       unlockAudioContext();
       document.getElementById("twoPlayerChoice").style.display = "none";
+      track("ai_player_added", { level: gameState.table_id });
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action: "ADD_BOT" }));
     }
     function chooseWaitForPlayer() {
       waitChosenAt = seatedKey();
+      track("wait_for_player", { level: gameState.table_id });
       document.getElementById("twoPlayerChoice").style.display = "none";
       showToast("Waiting for a 3rd player. Tap 🤖 +Bot any time to add an AI player.");
     }
