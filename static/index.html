@@ -157,6 +157,11 @@
     .auth-help { color: #94a3b8; font-size: 13px; margin: 0 0 14px; text-align: left; }
     .recovery-key { font: bold 22px monospace; letter-spacing: 2px; color: #facc15; background: #030712; border: 1px dashed #facc15; border-radius: 8px; padding: 12px; margin: 12px 0; user-select: all; }
 
+    /* Two players seated: add an AI player now, or wait for a third person */
+    #twoPlayerChoice { display: none; width: min(860px, calc(100% - 16px)); margin: 8px auto 0; background: #1e1b4b; border: 1px solid #6366f1; border-radius: 10px; padding: 10px 12px; text-align: center; }
+    #twoPlayerChoice p { margin: 0 0 8px; font-size: 14px; color: #e0e7ff; }
+    #twoPlayerChoice .btn-action { margin: 4px; }
+
     /* After-hand review: every player's cards with a right/wrong verdict */
     #reviewPanel { display: none; width: min(860px, calc(100% - 16px)); margin: 8px auto 0; background: #111827; border: 1px solid #374151; border-radius: 10px; padding: 10px 12px; }
     #reviewPanel h3 { margin: 0 0 6px; font-size: 15px; color: #c084fc; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
@@ -293,6 +298,12 @@
       </div>
       <div id="alertBanner">Connecting to table...</div>
       <button class="btn-action" id="btnAudioToggle" onclick="toggleAudio(event)">🔊 Sound: ON</button>
+    </div>
+
+    <div id="twoPlayerChoice" role="group" aria-label="Start with two players">
+      <p>2 players at the table. A hand needs 3: add an AI player, or wait for a 3rd player?</p>
+      <button class="btn-action" style="background: #4f46e5;" onclick="chooseAiPlayer()">🤖 Play with AI player</button>
+      <button class="btn-action" style="background: #475569;" onclick="chooseWaitForPlayer()">⏳ Wait for 3rd player</button>
     </div>
 
     <div class="arena-layout">
@@ -654,6 +665,7 @@
       if (ws) { const old = ws; ws = null; old.close(); }
       document.getElementById("arenaView").style.display = "none";
       document.getElementById("reviewPanel").style.display = "none";
+      document.getElementById("twoPlayerChoice").style.display = "none";
       document.getElementById("lobbyView").style.display = "flex";
       fetchTables();
     }
@@ -687,6 +699,28 @@
       }
     }
     let reviewShownFor = null;
+
+    // Exactly 2 players seated and waiting: let them add an AI player or wait for a 3rd person.
+    let waitChosenAt = null;            // "table|player ids" when this player chose to wait
+    function seatedKey() {
+      return `${gameState.table_id}|${(gameState.players || []).map(p => p.id).sort().join(",")}`;
+    }
+    function renderTwoPlayerChoice(me) {
+      const box = document.getElementById("twoPlayerChoice");
+      const show = me && gameState.stage === "WAITING" && (gameState.players || []).length === 2
+        && waitChosenAt !== seatedKey();
+      box.style.display = show ? "block" : "none";
+    }
+    function chooseAiPlayer() {
+      unlockAudioContext();
+      document.getElementById("twoPlayerChoice").style.display = "none";
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action: "ADD_BOT" }));
+    }
+    function chooseWaitForPlayer() {
+      waitChosenAt = seatedKey();
+      document.getElementById("twoPlayerChoice").style.display = "none";
+      showToast("Waiting for a 3rd player. Tap 🤖 +Bot any time to add an AI player.");
+    }
 
     function addHouseBot() {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -854,6 +888,7 @@
         updateChatLog(gameState.logs || []);
         drawTable();
         renderReview();
+        renderTwoPlayerChoice(me);
       };
     }
 
