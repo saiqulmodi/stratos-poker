@@ -368,6 +368,503 @@
   </div>
 
   <script>
+    // ---- Offline table (16-Nov-2026, Stratos issue #42: "it must run without your own computer's server").
+    // When the poker server cannot be reached, the same table runs inside the browser: you against computer
+    // players, with the same rules as server/app.py (blinds, side pots, 60 s turn clock, bots, after-hand review).
+    // It speaks the server's STATE_UPDATE messages through a stand-in socket, so the screen code is unchanged.
+    // Nothing is sent anywhere; your chips stay on this device (poker_offline_* in local storage).
+    const OfflinePoker = (() => {
+      const RANKS = "23456789TJQKA", START_CHIPS = 1000, TURN_SECONDS = 60, REVIEW_SECONDS = 15;
+      const HAND_NAMES = ["High Card", "One Pair", "Two Pair", "Three of a Kind", "Straight",
+        "Flush", "Full House", "Four of a Kind", "Straight Flush"];
+      const DEFS = [["table_1", "Table 1 - Rookie Ring", 10, 20], ["table_2", "Table 2 - Standard Felt", 10, 20],
+        ["table_3", "Table 3 - Mid Stakes", 25, 50], ["table_4", "Table 4 - High Rollers", 50, 100],
+        ["table_5", "Table 5 - VIP Suite", 100, 200]];
+      const BOT_NAMES = ["Bot_Alpha", "Bot_Bravo", "Bot_Charlie", "Bot_Delta", "Bot_Echo"];
+      const ME = "me_offline";
+      const handLog = {};
+
+      function get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+      function put(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) {} }
+      function num(k, d) { const n = parseInt(get(k, d), 10); return n >= 0 ? n : d; }
+      function profile(name) {
+        if (name) put("poker_offline_name", name);
+        return { player_id: ME, name: name || get("poker_offline_name", "Player"), chips: num("poker_offline_chips", START_CHIPS),
+                 hands_won: num("poker_offline_won", 0), streak: 0, daily_bonus: 0 };
+      }
+      function hasName() { return get("poker_offline_name", "") !== ""; }
+
+      // ---- hand strength (engine/poker_core.py): [category, tie-breakers...], compared left to right
+      const val = (c) => RANKS.indexOf(c[0]) + 2;
+      function eval5(cs) {
+        let vals = cs.map(val).sort((a, b) => b - a);
+        const flush = cs.every((c) => c[1] === cs[0][1]);
+        const uniq = new Set(vals).size === 5;
+        let straight = uniq && vals[0] - vals[4] === 4;
+        if (uniq && vals.join() === "14,5,4,3,2") { straight = true; vals = [5, 4, 3, 2, 1]; }
+        const counts = {};
+        vals.forEach((v) => { counts[v] = (counts[v] || 0) + 1; });
+        const groups = Object.keys(counts).map(Number).map((v) => [counts[v], v]).sort((a, b) => b[0] - a[0] || b[1] - a[1]);
+        const pat = groups.map((g) => g[0]).join(), tb = groups.map((g) => g[1]);
+        let cat = 0;
+        if (straight && flush) cat = 8; else if (pat === "4,1") cat = 7; else if (pat === "3,2") cat = 6;
+        else if (flush) cat = 5; else if (straight) cat = 4; else if (pat === "3,1,1") cat = 3;
+        else if (pat === "2,2,1") cat = 2; else if (pat === "2,1,1,1") cat = 1;
+        return [cat].concat(tb);
+      }
+      function cmp(a, b) {
+        for (let i = 0; i < Math.max(a.length, b.length); i++) {
+          const x = a[i] === undefined ? -1 : a[i], y = b[i] === undefined ? -1 : b[i];
+          if (x !== y) return x - y;
+        }
+        return 0;
+      }
+      function score(cards) {
+        if (cards.length < 5) return [-1];
+        let best = null; const n = cards.length;
+        for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) for (let c = b + 1; c < n; c++)
+          for (let d = c + 1; d < n; d++) for (let e = d + 1; e < n; e++) {
+            const s = eval5([cards[a], cards[b], cards[c], cards[d], cards[e]]);
+            if (!best || cmp(s, best) > 0) best = s;
+          }
+        return best;
+      }
+      const handName = (s) => (s && s[0] >= 0 ? HAND_NAMES[s[0]] : "");
+      function newDeck() {
+        const d = [];
+        for (const r of RANKS) for (const s of "cdhs") d.push(r + s);
+        for (let i = d.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [d[i], d[j]] = [d[j], d[i]]; }
+        return d;
+      }
+      function sidePots(players) {
+        const contributors = players.filter((p) => p.total_contributed > 0);
+        if (!contributors.length) return [];
+        const levels = [...new Set(contributors.map((p) => p.total_contributed))].sort((a, b) => a - b);
+        const pots = []; let prev = 0, carry = 0;
+        for (const level of levels) {
+          const payers = contributors.filter((p) => p.total_contributed >= level);
+          const amount = (level - prev) * payers.length + carry; carry = 0;
+          const eligible = payers.filter((p) => !p.folded).map((p) => p.id);
+          if (amount > 0) {
+            if (eligible.length) pots.push({ amount, eligible });
+            else if (pots.length) pots[pots.length - 1].amount += amount;
+            else carry = amount;
+          }
+          prev = level;
+        }
+        return pots;
+      }
+
+      class Table {
+        constructor(sock, def, me) {
+          [this.table_id, this.name, this.small_blind, this.big_blind] = def;
+          this.sock = sock; this.players = []; this.logs = []; this.timers = new Set(); this.closed = false;
+          this.game_started = false; this.hand_no = 0; this.deck = []; this.community = []; this.pot = 0;
+          this.current_bet = 0; this.last_raise = this.big_blind; this.active = null; this.time_left = TURN_SECONDS;
+          this.dealer = -1; this.stage = "WAITING"; this.acted = new Set(); this.winner_banner = "";
+          this.review = {}; this.review_left = 0; this.seq = 0; this.starting = false;
+          this.me = this.newPlayer(ME, me.name, me.chips, me.hands_won, 0, false);
+          this.players.push(this.me);
+          this.log(`${me.name} joined Seat 1.`, "SYSTEM");
+          for (let i = 0; i < 3; i++) this.addBot();
+          this.send("Offline table: you against computer players. Dealing soon...");
+          this.evaluateStart();
+        }
+        later(fn, ms) {
+          const t = setTimeout(() => { this.timers.delete(t); if (!this.closed) fn(); }, ms);
+          this.timers.add(t);
+        }
+        close() { this.closed = true; this.timers.forEach(clearTimeout); this.timers.clear(); this.save(); }
+        save() { put("poker_offline_chips", this.me.chips); put("poker_offline_won", this.me.hands_won); }
+        log(text, sender = "DEALER") { this.logs.push({ sender, text }); if (this.logs.length > 60) this.logs.shift(); }
+        at(seat) { return this.players.find((p) => p.seat === seat) || null; }
+        inHand() { return this.players.filter((p) => p.cards.length && !p.folded); }
+        canAct() { return this.inHand().filter((p) => !p.all_in); }
+        seatsAfter(seat, seats) {
+          seats = [...seats].sort((a, b) => a - b);
+          return seats.filter((s) => s > seat).concat(seats.filter((s) => s <= seat));
+        }
+        nextNeeding(after) {
+          const actors = {};
+          this.canAct().forEach((p) => { actors[p.seat] = p; });
+          for (const s of this.seatsAfter(after === null ? -1 : after, Object.keys(actors).map(Number))) {
+            const p = actors[s];
+            if (!this.acted.has(p.id) || p.current_bet < this.current_bet) return s;
+          }
+          return null;
+        }
+        roundDone() {
+          const a = this.canAct();
+          if (!a.length) return true;
+          if (a.length === 1 && a[0].current_bet >= this.current_bet) return true;
+          return a.every((p) => this.acted.has(p.id) && p.current_bet === this.current_bet);
+        }
+        minRaiseTo() { return this.current_bet + Math.max(this.last_raise, this.big_blind); }
+        newPlayer(id, name, chips, won, seat, bot) {
+          return { id, name, chips, hands_won: won, seat, cards: [], current_bet: 0, total_contributed: 0,
+                   folded: this.game_started, all_in: false, is_bot: bot, connected: true, leaving: false, hand_desc: "" };
+        }
+        addBot() {
+          const taken = this.players.map((p) => p.seat), free = [0, 1, 2, 3, 4].filter((s) => !taken.includes(s));
+          if (!free.length) return false;
+          const names = this.players.map((p) => p.name);
+          const name = BOT_NAMES.find((b) => !names.includes(b)) || `Bot_${10 + Math.floor(Math.random() * 90)}`;
+          this.players.push(this.newPlayer("bot_" + Math.random().toString(36).slice(2, 10), name, START_CHIPS, 0, free[0], true));
+          this.log(`🤖 ${name} joined Seat ${free[0] + 1}.`, "SYSTEM");
+          return true;
+        }
+        removeBot() {
+          const bots = this.players.filter((p) => p.is_bot && !p.leaving);
+          if (!bots.length) return false;
+          const idle = bots.filter((b) => !(this.game_started && b.cards.length && !b.folded));
+          if (idle.length) {
+            const l = idle[idle.length - 1];
+            this.players = this.players.filter((p) => p !== l);
+            this.log(`🤖 ${l.name} was removed.`, "SYSTEM");
+          } else {
+            const l = bots[bots.length - 1];
+            l.leaving = true;
+            this.log(`🤖 ${l.name} will leave after this hand.`, "SYSTEM");
+          }
+          return true;
+        }
+
+        // ---- state out (same shape as the server's STATE_UPDATE)
+        send(banner, isAlert = false, sound = null) {
+          if (this.closed) return;
+          const turn = this.at(this.active);
+          const players = this.players.map((p) => {
+            const show = p === this.me || (this.stage === "SHOWDOWN" && p.cards.length > 0);
+            return { id: p.id, name: p.name, chips: p.chips, hands_won: p.hands_won, seat: p.seat,
+                     current_bet: p.current_bet, folded: p.folded, all_in: p.all_in, is_bot: p.is_bot,
+                     connected: p.connected, in_hand: p.cards.length > 0 && !p.folded,
+                     hand_desc: this.stage === "SHOWDOWN" && show ? p.hand_desc : "",
+                     cards: show ? p.cards.slice() : (p.cards.length ? ["??", "??"] : []) };
+          });
+          const myTurn = !!(turn && turn === this.me && !turn.folded && !turn.all_in
+                            && this.stage !== "WAITING" && this.stage !== "SHOWDOWN");
+          const payload = { type: "STATE_UPDATE", table_id: this.table_id, table_name: this.name, hand_no: this.hand_no,
+            players, pot: this.pot, current_bet: this.current_bet, min_raise_to: this.minRaiseTo(), big_blind: this.big_blind,
+            active_turn_seat: this.active, turn_time_left: this.time_left, dealer_seat: this.dealer, stage: this.stage,
+            community_cards: this.community.slice(), banner_message: banner || this.defaultBanner(), is_alert: isAlert,
+            is_my_turn: myTurn, sound_event: sound, logs: this.logs.slice(-20),
+            review: this.stage === "SHOWDOWN" ? this.review : null, review_left: this.stage === "SHOWDOWN" ? this.review_left : 0 };
+          try { if (this.sock.onmessage) this.sock.onmessage({ data: JSON.stringify(payload) }); } catch (e) { console.error(e); }
+        }
+        defaultBanner() {
+          if (this.stage === "WAITING") return `Waiting for players... (${this.ready().length}/2 needed: tap 🤖 +Bot)`;
+          if (this.winner_banner && this.stage === "SHOWDOWN") return this.winner_banner;
+          const t = this.at(this.active);
+          return `${this.name} | Pot: Rs. ${this.pot} | Turn: ${t ? t.name : "None"} (${this.time_left}s)`;
+        }
+
+        // ---- start of a hand
+        ready() { return this.players.filter((p) => p.connected && p.chips > 0 && !p.leaving); }
+        evaluateStart() {
+          if (this.game_started || this.starting) return;
+          if (this.ready().length >= 2) {
+            this.starting = true;
+            this.send(`🚨 ${this.name}: Hand starts in 3s...`, true);
+            this.later(() => { this.starting = false; if (!this.game_started) this.startHand(); }, 3000);
+          } else this.send();
+        }
+        postBlind(p, amount) {
+          const amt = Math.min(p.chips, amount);
+          p.chips -= amt; p.current_bet = amt; p.total_contributed = amt;
+          if (p.chips === 0) p.all_in = true;
+          return amt;
+        }
+        startHand() {
+          this.players = this.players.filter((p) => !p.leaving);
+          this.players.forEach((p) => { if (p.is_bot && p.chips <= 0) p.chips = START_CHIPS; });
+          this.players.forEach((p) => Object.assign(p, { cards: [], folded: true, all_in: false, current_bet: 0, total_contributed: 0, hand_desc: "" }));
+          const eligible = this.ready().sort((a, b) => a.seat - b.seat);
+          if (eligible.length < 2) {
+            this.game_started = false; this.stage = "WAITING"; this.active = null; this.pot = 0; this.community = [];
+            this.send("Waiting for players with chips...");
+            return;
+          }
+          this.game_started = true; this.hand_no += 1; this.stage = "PREFLOP"; this.winner_banner = ""; this.review = {};
+          this.deck = newDeck(); this.community = []; this.acted.clear(); this.last_raise = this.big_blind;
+          eligible.forEach((p) => { p.cards = this.deck.splice(0, 2); p.folded = false; });
+          if (this.me.cards.length) put("poker_offline_played", num("poker_offline_played", 0) + 1);
+          const seats = eligible.map((p) => p.seat);
+          this.dealer = this.seatsAfter(this.dealer, seats)[0];
+          const order = this.seatsAfter(this.dealer, seats);
+          let sb, bb;
+          if (eligible.length === 2) { sb = this.at(this.dealer); bb = this.at(order[0]); }
+          else { sb = this.at(order[0]); bb = this.at(order[1]); }
+          const dealer = this.at(this.dealer);
+          const sbAmt = this.postBlind(sb, this.small_blind), bbAmt = this.postBlind(bb, this.big_blind);
+          this.pot = sbAmt + bbAmt; this.current_bet = this.big_blind;
+          this.save();
+          this.log(`--- Hand #${this.hand_no} (Dealer: ${dealer.name}) ---`, "SYSTEM");
+          this.log(`${sb.name} posts SB (Rs. ${sbAmt}), ${bb.name} posts BB (Rs. ${bbAmt})`, "DEALER");
+          this.active = this.nextNeeding(bb.seat);
+          if (this.active === null || this.roundDone()) {
+            this.active = null;
+            this.send(null, false, "deal");
+            this.nextStage();
+            return;
+          }
+          this.send(`♠️ Hand Live! Dealer: ${dealer.name} | SB: ${sb.name}, BB: ${bb.name}`, false, "deal");
+          this.startTimer();
+        }
+
+        // ---- turn clock and computer players
+        startTimer() {
+          const seq = ++this.seq, p = this.at(this.active);
+          this.time_left = TURN_SECONDS;
+          const tick = () => {
+            if (seq !== this.seq) return;
+            this.time_left -= 1;
+            if (this.time_left > 0) { this.send(); this.later(tick, 1000); return; }
+            const q = this.at(this.active);
+            if (q && !q.folded && !q.all_in) {
+              const auto = q.current_bet >= this.current_bet ? "CHECK" : "FOLD";
+              this.log(`${q.name} timed out (Auto ${auto}).`, "TIMEOUT");
+              this.act(q.id, auto, 0);
+            }
+          };
+          this.later(tick, 1000);
+          if (p && p.is_bot) {
+            this.later(() => {
+              if (seq !== this.seq) return;
+              const b = this.at(this.active);
+              if (b !== p || b.folded || b.all_in) return;
+              const [action, raiseTo] = this.botDecide(b);
+              this.act(b.id, action, raiseTo);
+            }, 1200 + Math.random() * 1300);
+          }
+        }
+        botDecide(bot) {
+          const toCall = Math.max(0, this.current_bet - bot.current_bet), canCheck = toCall === 0, bb = this.big_blind;
+          let action;
+          if (this.stage === "PREFLOP") {
+            const [c1, c2] = bot.cards;
+            const strong = c1[0] === c2[0] || RANKS.indexOf(c1[0]) >= 8 || RANKS.indexOf(c2[0]) >= 8;
+            if (strong) action = toCall > 3 * bb ? "CALL" : (Math.random() < 0.35 ? "RAISE" : "CALL");
+            else action = toCall <= bb ? "CALL" : "FOLD";
+          } else {
+            const category = score(bot.cards.concat(this.community))[0];
+            if (category >= 2) action = Math.random() < 0.6 ? "RAISE" : "CALL";
+            else if (category === 1) action = toCall <= 4 * bb ? "CALL" : "FOLD";
+            else action = toCall <= bb && Math.random() < 0.3 ? "CALL" : "FOLD";
+          }
+          if (canCheck && (action === "CALL" || action === "FOLD")) action = "CHECK";
+          return [action, action === "RAISE" ? Math.max(this.minRaiseTo(), this.current_bet * 2) : 0];
+        }
+
+        // ---- actions
+        dispatch(d) {
+          const a = String(d.action || "");
+          if (a === "CHECK" || a === "CALL" || a === "FOLD") this.act(ME, a, 0);
+          else if (a === "RAISE") { const n = parseInt(d.amount, 10); if (n >= 0) this.act(ME, "RAISE", n); }
+          else if (a === "REBUY") this.rebuy();
+          else if (a === "CHAT") { const t = String(d.message || "").trim().slice(0, 100); if (t) { this.log(esc(t), this.me.name); this.send(); } }
+          else if (a === "ADD_BOT") { if (this.addBot()) { this.send(); this.evaluateStart(); } }
+          else if (a === "REMOVE_BOT") { if (this.removeBot()) this.send(); }
+        }
+        act(id, action, raiseTo) {
+          const player = this.players.find((p) => p.id === id);
+          if (!this.game_started || this.stage === "WAITING" || this.stage === "SHOWDOWN" || !player
+              || player.seat !== this.active || player.folded || player.all_in) return;
+          const toCall = Math.max(0, this.current_bet - player.current_bet);
+          if (action === "CHECK" && toCall > 0) return;
+          let target = 0;
+          if (action === "RAISE") {
+            const maxTo = player.current_bet + player.chips;
+            target = Math.min(Math.max(this.minRaiseTo(), raiseTo), maxTo);
+            if (target <= this.current_bet) action = "CALL";
+          }
+          if (action === "CALL" && toCall === 0) action = "CHECK";
+          this.seq++;
+          let sound = "bet";
+          if (action === "FOLD") { player.folded = true; sound = "fold"; this.log(`${player.name} folds.`, "ACTION"); }
+          else if (action === "CHECK") { sound = "check"; this.log(`${player.name} checks.`, "ACTION"); }
+          else if (action === "CALL") {
+            const amount = Math.min(player.chips, toCall);
+            this.putIn(player, amount);
+            this.log(`${player.name} calls Rs. ${amount}${player.all_in ? " (All-In!)" : ""}.`, "ACTION");
+          } else if (action === "RAISE") {
+            this.putIn(player, target - player.current_bet);
+            if (player.current_bet > this.current_bet) {
+              const size = player.current_bet - this.current_bet;
+              if (size >= this.last_raise) this.last_raise = size;
+              this.current_bet = player.current_bet;
+              this.acted.clear();
+            }
+            this.log(`${player.name} raises to Rs. ${player.current_bet}${player.all_in ? " (All-In!)" : ""}.`, "ACTION");
+          }
+          this.acted.add(id);
+          this.advance(sound);
+        }
+        putIn(p, amount) {
+          amount = Math.max(0, Math.min(amount, p.chips));
+          p.chips -= amount; p.current_bet += amount; p.total_contributed += amount; this.pot += amount;
+          if (p.chips === 0) p.all_in = true;
+          if (p === this.me) this.save();
+        }
+        rebuy() {
+          const p = this.me;
+          if (p.chips > 0) return;
+          if (this.game_started && this.stage !== "SHOWDOWN" && p.cards.length && !p.folded) return;
+          p.chips = START_CHIPS; this.save();
+          this.log(`${p.name} reloaded Rs. ${START_CHIPS}.`, "SYSTEM");
+          this.send(`${p.name} reloaded Rs. ${START_CHIPS}!`);
+          this.evaluateStart();
+        }
+
+        // ---- moving the hand along
+        advance(sound) {
+          const alive = this.inHand();
+          if (alive.length <= 1) { this.finish(alive[0] || null, "All opponents folded"); return; }
+          if (this.roundDone()) { this.nextStage(); return; }
+          this.active = this.nextNeeding(this.active);
+          if (this.active === null) { this.nextStage(); return; }
+          this.send(null, false, sound);
+          this.startTimer();
+        }
+        nextStage() {
+          this.acted.clear();
+          this.players.forEach((p) => { p.current_bet = 0; });
+          this.current_bet = 0; this.last_raise = this.big_blind; this.active = null; this.seq++;
+          if (this.stage === "RIVER") { this.showdown(); return; }
+          if (this.stage === "PREFLOP") {
+            this.stage = "FLOP"; const c = this.deck.splice(0, 3); this.community.push(...c); this.log(`Flop: [${c.join(" ")}]`);
+          } else if (this.stage === "FLOP") {
+            this.stage = "TURN"; const c = this.deck.shift(); this.community.push(c); this.log(`Turn: [${c}]`);
+          } else if (this.stage === "TURN") {
+            this.stage = "RIVER"; const c = this.deck.shift(); this.community.push(c); this.log(`River: [${c}]`);
+          }
+          if (this.canAct().length >= 2) {
+            this.active = this.nextNeeding(this.dealer);
+            this.send(null, false, "deal");
+            this.startTimer();
+            return;
+          }
+          this.send(null, false, "deal");          // everyone (or all but one) is all-in: run the board out
+          this.later(() => this.nextStage(), 1000);
+        }
+        showdown() {
+          const alive = this.inHand();
+          alive.forEach((p) => {
+            p.hand_score = score(p.cards.concat(this.community));
+            p.hand_desc = handName(p.hand_score) || "Showdown";
+            this.log(`${p.name} shows ${p.cards.join(" ")} (${p.hand_desc})`, "SHOWDOWN");
+          });
+          let pots = sidePots(this.players);
+          if (!pots.length) pots = [{ amount: this.pot, eligible: alive.map((p) => p.id) }];
+          const order = this.seatsAfter(this.dealer, alive.map((p) => p.seat));
+          let paid = 0; const summary = [], winnerIds = new Set();
+          const best = alive.reduce((b, p) => (!b || cmp(p.hand_score, b.hand_score) > 0 ? p : b), null);
+          pots.forEach((sub, idx) => {
+            const cands = alive.filter((p) => sub.eligible.includes(p.id));
+            if (!cands.length) return;
+            const top = cands.reduce((t, p) => (!t || cmp(p.hand_score, t) > 0 ? p.hand_score : t), null);
+            const winners = cands.filter((p) => cmp(p.hand_score, top) === 0).sort((a, b) => order.indexOf(a.seat) - order.indexOf(b.seat));
+            const share = Math.floor(sub.amount / winners.length), odd = sub.amount % winners.length;
+            winners.forEach((w, i) => {
+              const won = share + (i === 0 ? odd : 0);
+              w.chips += won; paid += won; winnerIds.add(w.id);
+              summary.push(`${w.name} won Rs. ${won} (Pot ${idx + 1}: ${w.hand_desc})`);
+            });
+          });
+          if (this.pot - paid > 0 && best) best.chips += this.pot - paid;
+          this.finish(best, summary.length ? summary.join(" | ") : "Showdown", true, winnerIds, true);
+        }
+        finish(winner, reason, alreadyPaid = false, winnerIds = null, showdown = false) {
+          this.seq++;
+          this.stage = "SHOWDOWN"; this.active = null;
+          const pot = this.pot;
+          if (winner) {
+            if (!alreadyPaid) winner.chips += pot;
+            winner.hands_won = (winner.hands_won || 0) + 1;
+            this.winner_banner = `🏆 ${winner.name} wins Rs. ${pot}! [${reason}]`;
+            this.log(`🏆 ${winner.name} awarded Rs. ${pot} (${reason})`, "POT");
+            const list = handLog[this.table_id] = handLog[this.table_id] || [];
+            list.unshift({ time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+                           winner: winner.name, pot, hand: winner.hand_desc || reason });
+            if (list.length > 20) list.pop();
+          } else this.winner_banner = "Hand ended.";
+          this.save();
+          try { this.review = this.buildReview(winnerIds || new Set(winner ? [winner.id] : []), showdown); }
+          catch (e) { this.review = {}; }
+          let left = REVIEW_SECONDS;
+          const step = () => {
+            if (this.stage !== "SHOWDOWN") return;
+            if (left > 0) {
+              this.review_left = left;
+              this.send(`${this.winner_banner} — Next in ${left}s...`, false, left === REVIEW_SECONDS ? "win" : null);
+              left -= 1;
+              this.later(step, 1000);
+              return;
+            }
+            this.startHand();
+            if (!this.game_started) this.evaluateStart();
+          };
+          step();
+        }
+        buildReview(winnerIds, showdown) {
+          const dealt = this.players.filter((p) => p.cards.length);
+          const played = this.community.slice(), missing = Math.max(0, 5 - played.length);
+          const board = played.concat(missing ? this.deck.slice(0, missing) : []);
+          const scores = {};
+          dealt.forEach((p) => { scores[p.id] = score(p.cards.concat(board)); });
+          const best = dealt.reduce((b, p) => (!b || cmp(scores[p.id], b) > 0 ? scores[p.id] : b), null);
+          const bestNames = dealt.filter((p) => cmp(scores[p.id], best) === 0).map((p) => p.name).join(" & ");
+          const bestHand = handName(best);
+          const winners = dealt.filter((p) => winnerIds.has(p.id));
+          const winNames = winners.map((p) => p.name).join(" & ");
+          const ws = winners.reduce((b, p) => (!b || cmp(scores[p.id], b) > 0 ? scores[p.id] : b), null);
+          const winHand = handName(ws);
+          const rows = dealt.slice().sort((a, b) => a.seat - b.seat).map((p) => {
+            const hand = handName(scores[p.id]), wouldWin = cmp(scores[p.id], best) === 0;
+            let result, verdict, right;
+            if (winnerIds.has(p.id)) {
+              result = "won";
+              if (showdown) { verdict = `Won with ${hand}.`; right = true; if (!wouldWin) verdict += ` (${bestNames} folded a better hand: ${bestHand}.)`; }
+              else if (wouldWin) { verdict = `Won - everyone folded. ${hand} was the best hand anyway.`; right = true; }
+              else { verdict = `Won - everyone folded. Bluff worked: ${bestNames} would have won with ${bestHand}.`; right = true; }
+            } else if (p.folded) {
+              result = "folded";
+              if (wouldWin) { verdict = `Fold was a mistake: your ${hand} would have won.`; right = false; }
+              else { verdict = `Fold was right: ${bestNames} would have won with ${bestHand}.`; right = true; }
+            } else { result = "lost"; verdict = `Lost: your ${hand} lost to ${winNames}'s ${winHand}.`; right = false; }
+            return { id: p.id, seat: p.seat, name: p.name, cards: p.cards, hand, result, verdict, right };
+          });
+          return { hand_no: this.hand_no, board, played: played.length, players: rows };
+        }
+      }
+
+      // Stands in for the WebSocket: same readyState / send / close / onmessage the screen code uses.
+      class Socket {
+        constructor(url) {
+          this.readyState = 1; this.onmessage = null; this.onopen = null; this.onclose = null; this.closed = false;
+          const m = /\/ws\/([^/?]+)/.exec(url), def = DEFS.find((d) => d[0] === (m && m[1])) || DEFS[0];
+          setTimeout(() => {
+            if (this.closed) return;
+            if (this.onopen) this.onopen();
+            this.table = new Table(this, def, profile());
+          }, 50);
+        }
+        send(text) { let d; try { d = JSON.parse(text); } catch (e) { return; } if (this.table && !this.closed) this.table.dispatch(d); }
+        close() { this.closed = true; this.readyState = 3; if (this.table) this.table.close(); }
+      }
+
+      function tables() {
+        return DEFS.map(([table_id, name, sb, bb]) => ({ table_id, name, blinds: `Rs. ${sb} / ${bb}`, players_count: 4,
+                                                        max_players: 5, stage: "WAITING", pot: 0 }));
+      }
+      function leaders() {
+        const p = profile(), played = num("poker_offline_played", 0);
+        return [{ name: p.name, chips: p.chips, won: p.hands_won, played,
+                  win_rate: played ? Math.round((100 * p.hands_won) / played) + "%" : "0%" }];
+      }
+      return { Socket, profile, hasName, tables, leaders, history: (id) => handLog[id] || [] };
+    })();
+  </script>
+  <script>
     const canvas = document.getElementById("tableCanvas");
     const ctx = canvas.getContext("2d");
     const banner = document.getElementById("alertBanner");
@@ -386,6 +883,16 @@
     // Stratos (any page not served by this server) = nickname only, no email or phone (Stratos rule, 07-Nov-2026).
     // The owner's own link (Funnel / localhost) keeps email + phone + email code + PIN.
     const GUEST_MODE = !servedByServer || new URLSearchParams(location.search).has("nickname");
+    // No server (the owner's laptop is off): the Stratos page plays the offline table in the browser (OfflinePoker).
+    let offline = false;
+    async function serverUp() {
+      try {
+        const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 5000);
+        const res = await fetch(`${API}/api/health`, { signal: ctl.signal });
+        clearTimeout(t);
+        return res.ok;
+      } catch (e) { return false; }
+    }
 
     function store(key, value) {
       try { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch (e) {}
@@ -406,7 +913,12 @@
       if (!gameStartedAt) return;
       const seconds = Math.round((Date.now() - gameStartedAt) / 1000);
       gameStartedAt = 0;
-      track(won ? "level_complete" : "game_over", { seconds: seconds, score: score || 0 });
+      // Online tables earn no Stratos Coins (Stratos rule: friends could farm them), so every hand ends as game_over
+      // (never level_complete); `result` tells a won hand from a lost one. Only the offline table (you against the
+      // computer) adds won: true, which Stratos pays as a win.
+      const d = { seconds: seconds, score: score || 0, result: won ? "up" : "down" };
+      if (offline && won) d.won = true;
+      track("game_over", d);
     }
     // Rewarded moment (Stratos): ads are not live yet, so the reward is given straight away.
     function offerReward(onDone) { onDone(); }
@@ -559,6 +1071,19 @@
       const name = document.getElementById("guestNameInput").value.trim();
       errBox.innerText = "";
       if (name.length < 2) { errBox.innerText = "Enter a nickname (2 to 15 letters)."; return; }
+      if (!servedByServer) {
+        const btn = document.getElementById("guestBtn");
+        btn.disabled = true;
+        serverUp().then((up) => {
+          btn.disabled = false;
+          if (up) { authRequest("/api/guest", { name, token: authToken || "" }, errBox, btn); return; }
+          offline = true;
+          unlockAudioContext();
+          track("signin", { level: "offline" });
+          enterLobby(OfflinePoker.profile(name));
+        });
+        return;
+      }
       authRequest("/api/guest", { name, token: authToken || "" }, errBox, document.getElementById("guestBtn"));
     }
 
@@ -712,10 +1237,31 @@
 
     async function fetchTables() {
       const grid = document.getElementById("tablesGrid");
+      if (offline) { renderTables(OfflinePoker.tables()); return; }
       try {
         const res = await fetch(`${API}/api/tables`);
-        const tables = await res.json();
-        grid.innerHTML = tables.map(t => {
+        renderTables(await res.json());
+      } catch (e) {
+        if (GUEST_MODE) { offline = true; renderTables(OfflinePoker.tables()); return; }
+        grid.innerHTML = `<div class="table-card"><h3>Tables are closed right now</h3>
+          <div class="table-meta">The poker server is offline. Please try again in a little while.</div>
+          <button class="btn-action" onclick="fetchTables()">Try again</button></div>`;
+      }
+    }
+
+    function renderTables(tables) {
+      const grid = document.getElementById("tablesGrid");
+      let note = "";
+      if (offline) {
+        const p = OfflinePoker.profile(OfflinePoker.hasName() ? "" : (localPlayerName || ""));
+        localPlayerId = p.player_id;
+        localPlayerName = p.name;
+        document.getElementById("lobbyPlayerLabel").innerText = `Player: ${p.name} | Rs. ${p.chips} | 🤖 vs computer`;
+        note = `<div class="table-card"><h3>🤖 Play against the computer</h3>
+          <div class="table-meta">The live tables are closed right now, so computer players join you. Your chips stay on this device.</div></div>`;
+      }
+      {
+        grid.innerHTML = note + tables.map(t => {
           const isFull = t.players_count >= t.max_players;
           return `
             <div class="table-card">
@@ -734,10 +1280,6 @@
             </div>
           `;
         }).join("");
-      } catch (e) {
-        grid.innerHTML = `<div class="table-card"><h3>Tables are closed right now</h3>
-          <div class="table-meta">The poker server is offline. Please try again in a little while.</div>
-          <button class="btn-action" onclick="fetchTables()">Try again</button></div>`;
       }
     }
 
@@ -833,8 +1375,7 @@
     // --- Leaderboard & History Modals ---
     async function openLeaderboard() {
       try {
-        const res = await fetch(`${API}/api/leaderboard`);
-        const leaders = await res.json();
+        const leaders = offline ? OfflinePoker.leaders() : await (await fetch(`${API}/api/leaderboard`)).json();
         document.getElementById("modalTitle").innerText = "🏆 All-Time Leaderboard";
         document.getElementById("modalContent").innerHTML = `
           <table class="data-table">
@@ -860,8 +1401,7 @@
     async function openHandHistory() {
       if (!currentTableId) return;
       try {
-        const res = await fetch(`${API}/api/history/${currentTableId}`);
-        const history = await res.json();
+        const history = offline ? OfflinePoker.history(currentTableId) : await (await fetch(`${API}/api/history/${currentTableId}`)).json();
         document.getElementById("modalTitle").innerText = "📜 Recent Hands";
         document.getElementById("modalContent").innerHTML = history.length ? `
           <table class="data-table">
@@ -918,7 +1458,7 @@
       const socketUrl = `${WS_BASE}/ws/${tableId}/${encodeURIComponent(pid || "me")}?token=${encodeURIComponent(authToken || "")}`;
       banner.innerText = `Connecting to ${tableId}...`;
 
-      const sock = new WebSocket(socketUrl);
+      const sock = offline ? new OfflinePoker.Socket(socketUrl) : new WebSocket(socketUrl);
       ws = sock;
       let refused = false;
 
